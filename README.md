@@ -59,6 +59,6 @@ You can override the default locations with:
 
 ## Usage Data
 
-The displayed usage is the latest Codex rate-limit snapshot already present in `~/.codex/logs_1.sqlite`. It is not a live billing API query.
+The displayed usage prefers the latest Codex rate-limit snapshot already present in `~/.codex/logs_1.sqlite`. If that snapshot is missing for an account, `gpt-switcher` falls back to local per-account token totals inferred from Codex thread history in `~/.codex/state_5.sqlite`.
 
 If no matching usage event is present yet for an account, `gpt-switcher` shows `unknown`.

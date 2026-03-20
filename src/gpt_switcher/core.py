@@ -44,6 +44,10 @@ class AppPaths:
         return self.codex_home / "logs_1.sqlite"
 
     @property
+    def state_path(self) -> Path:
+        return self.codex_home / "state_5.sqlite"
+
+    @property
     def registry_path(self) -> Path:
         return self.switcher_home / "registry.json"
 
@@ -89,6 +93,8 @@ class UsageSnapshot:
     credits_has_credits: bool | None
     credits_balance: str | None
     credits_unlimited: bool | None
+    local_tokens_used: int | None = None
+    local_thread_count: int | None = None
 
 
 @dataclass(frozen=True)
@@ -416,6 +422,119 @@ def load_latest_usage_by_account(logs_path: Path) -> dict[str, UsageSnapshot]:
             connection.close()
 
 
+def load_local_usage_by_account(logs_path: Path, state_path: Path) -> dict[str, UsageSnapshot]:
+    if not logs_path.exists() or not state_path.exists():
+        return {}
+
+    logs_connection: sqlite3.Connection | None = None
+    state_connection: sqlite3.Connection | None = None
+    try:
+        logs_uri = f"file:{logs_path.as_posix()}?mode=ro"
+        logs_connection = sqlite3.connect(logs_uri, uri=True)
+        logs_connection.row_factory = sqlite3.Row
+
+        request_rows = logs_connection.execute(
+            """
+            SELECT thread_id, ts, message
+            FROM logs
+            WHERE target = 'log'
+              AND message LIKE ?
+              AND thread_id IS NOT NULL
+            ORDER BY id ASC
+            """,
+            (f"{REQUEST_MESSAGE_PREFIX}%",),
+        ).fetchall()
+
+        account_threads: dict[str, set[str]] = {}
+        account_last_seen: dict[str, int] = {}
+        for row in request_rows:
+            thread_id = row["thread_id"]
+            message = row["message"]
+            if not isinstance(thread_id, str) or not isinstance(message, str):
+                continue
+
+            match = ACCOUNT_ID_PATTERN.search(message)
+            if not match:
+                continue
+
+            account_id = match.group(1).strip()
+            account_threads.setdefault(account_id, set()).add(thread_id)
+            ts_value = row["ts"]
+            if isinstance(ts_value, int):
+                previous = account_last_seen.get(account_id)
+                if previous is None or ts_value > previous:
+                    account_last_seen[account_id] = ts_value
+
+        if not account_threads:
+            return {}
+
+        state_uri = f"file:{state_path.as_posix()}?mode=ro"
+        state_connection = sqlite3.connect(state_uri, uri=True)
+        state_connection.row_factory = sqlite3.Row
+
+        local_usage: dict[str, UsageSnapshot] = {}
+        for account_id, thread_ids in account_threads.items():
+            placeholders = ",".join("?" for _ in thread_ids)
+            row = state_connection.execute(
+                f"""
+                SELECT
+                    COUNT(*) AS thread_count,
+                    COALESCE(SUM(tokens_used), 0) AS total_tokens,
+                    MAX(updated_at) AS last_updated
+                FROM threads
+                WHERE id IN ({placeholders})
+                """,
+                list(thread_ids),
+            ).fetchone()
+
+            if row is None:
+                continue
+
+            thread_count = parse_int(row["thread_count"])
+            total_tokens = parse_int(row["total_tokens"])
+            observed_at = parse_int(row["last_updated"]) or account_last_seen.get(account_id)
+            if not thread_count or observed_at is None:
+                continue
+
+            local_usage[account_id] = UsageSnapshot(
+                observed_at=observed_at,
+                source="local_threads",
+                plan_type=None,
+                limit_reached=False,
+                primary_used_percent=None,
+                secondary_used_percent=None,
+                primary_window_minutes=None,
+                secondary_window_minutes=None,
+                primary_reset_at=None,
+                secondary_reset_at=None,
+                credits_has_credits=None,
+                credits_balance=None,
+                credits_unlimited=None,
+                local_tokens_used=total_tokens,
+                local_thread_count=thread_count,
+            )
+
+        return local_usage
+    except sqlite3.DatabaseError:
+        return {}
+    finally:
+        if logs_connection is not None:
+            logs_connection.close()
+        if state_connection is not None:
+            state_connection.close()
+
+
+def load_usage_by_account(logs_path: Path, state_path: Path | None = None) -> dict[str, UsageSnapshot]:
+    usage = load_latest_usage_by_account(logs_path)
+    if state_path is None:
+        return usage
+
+    for account_id, local_snapshot in load_local_usage_by_account(logs_path, state_path).items():
+        usage.setdefault(account_id, local_snapshot)
+
+    return usage
+
+
 def format_timestamp(timestamp: int | None) -> str:
     if timestamp is None:
         return "unknown"
@@ -425,6 +544,11 @@ def format_timestamp(timestamp: int | None) -> str:
 def summarize_usage(snapshot: UsageSnapshot | None) -> str:
     if snapshot is None:
         return "unknown"
+
+    if snapshot.source == "local_threads":
+        token_text = str(snapshot.local_tokens_used) if snapshot.local_tokens_used is not None else "?"
+        thread_text = str(snapshot.local_thread_count) if snapshot.local_thread_count is not None else "?"
+        return f"local tokens:{token_text} threads:{thread_text} last:{format_timestamp(snapshot.observed_at)}"
 
     status = "reached" if snapshot.limit_reached else "available"
     primary = f"{snapshot.primary_used_percent}%" if snapshot.primary_used_percent is not None else "?"
@@ -552,7 +676,7 @@ class SwitcherService:
         return ActiveStatus(metadata=metadata, saved_account=saved_account, usage=usage)
 
     def load_usage(self) -> dict[str, UsageSnapshot]:
-        return load_latest_usage_by_account(self.paths.logs_path)
+        return load_usage_by_account(self.paths.logs_path, self.paths.state_path)
 
     def _load_registry(self) -> dict[str, SavedAccount]:
         if not self.paths.registry_path.exists():

@@ -18,6 +18,7 @@ from gpt_switcher.core import (
     SwitcherService,
     extract_auth_metadata,
     load_latest_usage_by_account,
+    load_usage_by_account,
     read_json_file,
 )
 
@@ -83,6 +84,56 @@ def create_logs_db(path: Path) -> None:
             estimated_bytes INTEGER NOT NULL DEFAULT 0
         )
         """
+    )
+    connection.commit()
+    connection.close()
+
+
+def create_state_db(path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    connection = sqlite3.connect(path)
+    connection.execute(
+        """
+        CREATE TABLE threads (
+            id TEXT PRIMARY KEY,
+            rollout_path TEXT NOT NULL DEFAULT '',
+            created_at INTEGER NOT NULL DEFAULT 0,
+            updated_at INTEGER NOT NULL DEFAULT 0,
+            source TEXT NOT NULL DEFAULT 'cli',
+            model_provider TEXT NOT NULL DEFAULT 'openai',
+            cwd TEXT NOT NULL DEFAULT '',
+            title TEXT NOT NULL DEFAULT '',
+            sandbox_policy TEXT NOT NULL DEFAULT '',
+            approval_mode TEXT NOT NULL DEFAULT '',
+            tokens_used INTEGER NOT NULL DEFAULT 0,
+            has_user_event INTEGER NOT NULL DEFAULT 0,
+            archived INTEGER NOT NULL DEFAULT 0,
+            archived_at INTEGER,
+            git_sha TEXT,
+            git_branch TEXT,
+            git_origin_url TEXT,
+            cli_version TEXT NOT NULL DEFAULT '',
+            first_user_message TEXT NOT NULL DEFAULT '',
+            agent_nickname TEXT,
+            agent_role TEXT,
+            memory_mode TEXT NOT NULL DEFAULT 'enabled',
+            model TEXT,
+            reasoning_effort TEXT
+        )
+        """
+    )
+    connection.commit()
+    connection.close()
+
+
+def insert_thread(path: Path, *, thread_id: str, tokens_used: int, updated_at: int) -> None:
+    connection = sqlite3.connect(path)
+    connection.execute(
+        """
+        INSERT INTO threads (id, updated_at, tokens_used, rollout_path, source, model_provider, cwd, title, sandbox_policy, approval_mode, cli_version, first_user_message, memory_mode)
+        VALUES (?, ?, ?, '', 'cli', 'openai', '', '', '', '', '', '', 'enabled')
+        """,
+        (thread_id, updated_at, tokens_used),
     )
     connection.commit()
     connection.close()
@@ -303,6 +354,34 @@ class SwitcherCliTests(unittest.TestCase):
         self.assertEqual(stderr, "")
         self.assertIn("personal", stdout)
         self.assertIn("unknown", stdout)
+
+    def test_usage_falls_back_to_local_thread_tokens(self) -> None:
+        create_logs_db(self.paths.logs_path)
+        create_state_db(self.paths.state_path)
+        insert_log(
+            self.paths.logs_path,
+            ts=300,
+            target="log",
+            message=request_message("account-local"),
+            thread_id="thread-local-1",
+        )
+        insert_log(
+            self.paths.logs_path,
+            ts=301,
+            target="log",
+            message=request_message("account-local"),
+            thread_id="thread-local-2",
+        )
+        insert_thread(self.paths.state_path, thread_id="thread-local-1", tokens_used=1000, updated_at=555)
+        insert_thread(self.paths.state_path, thread_id="thread-local-2", tokens_used=2500, updated_at=777)
+
+        usage = load_usage_by_account(self.paths.logs_path, self.paths.state_path)
+
+        snapshot = usage["account-local"]
+        self.assertEqual(snapshot.source, "local_threads")
+        self.assertEqual(snapshot.local_tokens_used, 3500)
+        self.assertEqual(snapshot.local_thread_count, 2)
+        self.assertEqual(snapshot.observed_at, 777)
 
 
 if __name__ == "__main__":
