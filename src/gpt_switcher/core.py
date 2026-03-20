@@ -6,7 +6,7 @@ import os
 import re
 import sqlite3
 import tempfile
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -95,6 +95,7 @@ class UsageSnapshot:
     credits_unlimited: bool | None
     local_tokens_used: int | None = None
     local_thread_count: int | None = None
+    local_share_percent: float | None = None
 
 
 @dataclass(frozen=True)
@@ -526,7 +527,20 @@ def load_local_usage_by_account(logs_path: Path, state_path: Path) -> dict[str, 
                 local_thread_count=thread_count,
             )
 
-        return local_usage
+        total_local_tokens = sum(
+            snapshot.local_tokens_used or 0
+            for snapshot in local_usage.values()
+        )
+        if total_local_tokens <= 0:
+            return local_usage
+
+        return {
+            account_id: replace(
+                snapshot,
+                local_share_percent=((snapshot.local_tokens_used or 0) * 100.0 / total_local_tokens),
+            )
+            for account_id, snapshot in local_usage.items()
+        }
     except sqlite3.DatabaseError:
         return {}
     finally:
@@ -553,14 +567,33 @@ def format_timestamp(timestamp: int | None) -> str:
     return datetime.fromtimestamp(timestamp).astimezone().strftime("%Y-%m-%d %H:%M")
 
 
+def format_token_count(tokens: int | None) -> str:
+    if tokens is None:
+        return "?"
+
+    magnitude = abs(tokens)
+    if magnitude >= 1_000_000_000:
+        return f"{tokens / 1_000_000_000:.1f}B"
+    if magnitude >= 1_000_000:
+        return f"{tokens / 1_000_000:.1f}M"
+    if magnitude >= 1_000:
+        return f"{tokens / 1_000:.1f}K"
+    return f"{tokens:,}"
+
+
 def summarize_usage(snapshot: UsageSnapshot | None) -> str:
     if snapshot is None:
         return "unknown"
 
     if snapshot.source == "local_threads":
-        token_text = str(snapshot.local_tokens_used) if snapshot.local_tokens_used is not None else "?"
+        token_text = format_token_count(snapshot.local_tokens_used)
         thread_text = str(snapshot.local_thread_count) if snapshot.local_thread_count is not None else "?"
-        return f"local tokens:{token_text} threads:{thread_text} last:{format_timestamp(snapshot.observed_at)}"
+        share_text = (
+            f"{snapshot.local_share_percent:.1f}%"
+            if snapshot.local_share_percent is not None
+            else "?"
+        )
+        return f"local history {token_text} ({share_text}, {thread_text} threads, last {format_timestamp(snapshot.observed_at)})"
 
     status = "reached" if snapshot.limit_reached else "available"
     primary = f"{snapshot.primary_used_percent}%" if snapshot.primary_used_percent is not None else "?"

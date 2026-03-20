@@ -59,6 +59,6 @@ You can override the default locations with:
 
 ## Usage Data
 
-The displayed usage prefers the latest Codex rate-limit snapshot already present in `~/.codex/logs_1.sqlite`. If that snapshot is missing for an account, `gpt-switcher` falls back to local per-account token totals inferred from Codex thread history in `~/.codex/state_5.sqlite`.
+The displayed usage prefers the latest Codex rate-limit snapshot already present in `~/.codex/logs_1.sqlite`. If that snapshot is missing for an account, `gpt-switcher` falls back to local per-account token totals inferred from Codex thread history in `~/.codex/state_5.sqlite`, plus that account's percentage share of all locally tracked accounts.
 
 If no matching usage event is present yet for an account, `gpt-switcher` shows `unknown`.

@@ -20,6 +20,7 @@ from gpt_switcher.core import (
     load_latest_usage_by_account,
     load_usage_by_account,
     read_json_file,
+    summarize_usage,
 )
 
 
@@ -383,6 +384,33 @@ class SwitcherCliTests(unittest.TestCase):
         self.assertEqual(snapshot.local_tokens_used, 3500)
         self.assertEqual(snapshot.local_thread_count, 2)
         self.assertEqual(snapshot.observed_at, 777)
+
+    def test_local_usage_summary_shows_percentage_share(self) -> None:
+        create_logs_db(self.paths.logs_path)
+        create_state_db(self.paths.state_path)
+        insert_log(
+            self.paths.logs_path,
+            ts=500,
+            target="log",
+            message=request_message("account-a"),
+            thread_id="thread-a",
+        )
+        insert_log(
+            self.paths.logs_path,
+            ts=501,
+            target="log",
+            message=request_message("account-b"),
+            thread_id="thread-b",
+        )
+        insert_thread(self.paths.state_path, thread_id="thread-a", tokens_used=100, updated_at=1_700_000_600)
+        insert_thread(self.paths.state_path, thread_id="thread-b", tokens_used=300, updated_at=1_700_000_700)
+
+        usage = load_usage_by_account(self.paths.logs_path, self.paths.state_path)
+
+        summary = summarize_usage(usage["account-a"])
+        self.assertIn("local history", summary)
+        self.assertIn("100", summary)
+        self.assertIn("25.0%", summary)
 
     def test_usage_parser_supports_feedback_log_body_schema(self) -> None:
         create_logs_db(self.paths.logs_path, body_column="feedback_log_body")

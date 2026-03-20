@@ -87,6 +87,8 @@ def command_status(service: SwitcherService) -> int:
     if status.metadata.token_expires_at is not None:
         print(f"Access token expires: {format_timestamp(status.metadata.token_expires_at)}")
     print(f"Usage: {summarize_usage(status.usage)}")
+    if status.usage is not None and status.usage.source == "local_threads":
+        print("Usage source: local Codex thread history, not live ChatGPT quota.")
     if status.usage is not None:
         print(f"Usage observed: {format_timestamp(status.usage.observed_at)}")
     return 0
