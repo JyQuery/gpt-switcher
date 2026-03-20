@@ -64,18 +64,18 @@ def write_auth_file(path: Path, account_id: str, email: str, plan_type: str = "p
     path.write_text(json.dumps(payload), encoding="utf-8")
 
 
-def create_logs_db(path: Path) -> None:
+def create_logs_db(path: Path, body_column: str = "message") -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     connection = sqlite3.connect(path)
     connection.execute(
-        """
+        f"""
         CREATE TABLE logs (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             ts INTEGER NOT NULL,
             ts_nanos INTEGER NOT NULL DEFAULT 0,
             level TEXT NOT NULL DEFAULT 'INFO',
             target TEXT NOT NULL,
-            message TEXT,
+            {body_column} TEXT,
             module_path TEXT,
             file TEXT,
             line INTEGER,
@@ -147,11 +147,12 @@ def insert_log(
     message: str,
     thread_id: str,
     process_uuid: str = "proc-1",
+    body_column: str = "message",
 ) -> None:
     connection = sqlite3.connect(path)
     connection.execute(
-        """
-        INSERT INTO logs (ts, target, message, thread_id, process_uuid)
+        f"""
+        INSERT INTO logs (ts, target, {body_column}, thread_id, process_uuid)
         VALUES (?, ?, ?, ?, ?)
         """,
         (ts, target, message, thread_id, process_uuid),
@@ -382,6 +383,51 @@ class SwitcherCliTests(unittest.TestCase):
         self.assertEqual(snapshot.local_tokens_used, 3500)
         self.assertEqual(snapshot.local_thread_count, 2)
         self.assertEqual(snapshot.observed_at, 777)
+
+    def test_usage_parser_supports_feedback_log_body_schema(self) -> None:
+        create_logs_db(self.paths.logs_path, body_column="feedback_log_body")
+        insert_log(
+            self.paths.logs_path,
+            ts=400,
+            target="log",
+            message=request_message("account-schema"),
+            thread_id="thread-schema",
+            body_column="feedback_log_body",
+        )
+        insert_log(
+            self.paths.logs_path,
+            ts=401,
+            target="codex_api::endpoint::responses_websocket",
+            message=websocket_event(
+                {
+                    "type": "codex.rate_limits",
+                    "plan_type": "plus",
+                    "rate_limits": {
+                        "allowed": True,
+                        "limit_reached": False,
+                        "primary": {
+                            "used_percent": 7,
+                            "window_minutes": 300,
+                            "reset_at": 1775000000,
+                        },
+                        "secondary": {
+                            "used_percent": 11,
+                            "window_minutes": 10080,
+                            "reset_at": 1775600000,
+                        },
+                    },
+                    "credits": None,
+                }
+            ),
+            thread_id="thread-schema",
+            body_column="feedback_log_body",
+        )
+
+        usage = load_latest_usage_by_account(self.paths.logs_path)
+
+        snapshot = usage["account-schema"]
+        self.assertEqual(snapshot.primary_used_percent, 7)
+        self.assertEqual(snapshot.secondary_used_percent, 11)
 
 
 if __name__ == "__main__":

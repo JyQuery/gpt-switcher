@@ -242,6 +242,16 @@ def parse_bool(value: Any) -> bool | None:
     return None
 
 
+def detect_log_body_column(connection: sqlite3.Connection) -> str:
+    rows = connection.execute("PRAGMA table_info(logs)").fetchall()
+    column_names = {row[1] for row in rows if len(row) > 1}
+    if "message" in column_names:
+        return "message"
+    if "feedback_log_body" in column_names:
+        return "feedback_log_body"
+    raise sqlite3.DatabaseError("logs table is missing both message and feedback_log_body columns.")
+
+
 def resolve_account_id(
     event_id: int,
     thread_id: Any,
@@ -344,13 +354,14 @@ def load_latest_usage_by_account(logs_path: Path) -> dict[str, UsageSnapshot]:
         uri = f"file:{logs_path.as_posix()}?mode=ro"
         connection = sqlite3.connect(uri, uri=True)
         connection.row_factory = sqlite3.Row
+        body_column = detect_log_body_column(connection)
 
         request_rows = connection.execute(
-            """
-            SELECT id, thread_id, process_uuid, message
+            f"""
+            SELECT id, thread_id, process_uuid, {body_column} AS body
             FROM logs
             WHERE target = 'log'
-              AND message LIKE ?
+              AND {body_column} LIKE ?
             ORDER BY id ASC
             """,
             (f"{REQUEST_MESSAGE_PREFIX}%",),
@@ -359,7 +370,7 @@ def load_latest_usage_by_account(logs_path: Path) -> dict[str, UsageSnapshot]:
         thread_to_account: dict[str, str] = {}
         process_to_requests: dict[str, list[tuple[int, str]]] = {}
         for row in request_rows:
-            message = row["message"]
+            message = row["body"]
             if not isinstance(message, str):
                 continue
 
@@ -377,13 +388,13 @@ def load_latest_usage_by_account(logs_path: Path) -> dict[str, UsageSnapshot]:
                 process_to_requests.setdefault(process_uuid, []).append((int(row["id"]), account_id))
 
         event_rows = connection.execute(
-            """
-            SELECT id, ts, thread_id, process_uuid, message
+            f"""
+            SELECT id, ts, thread_id, process_uuid, {body_column} AS body
             FROM logs
             WHERE target = 'codex_api::endpoint::responses_websocket'
               AND (
-                message LIKE 'websocket event: {"type":"codex.rate_limits"%'
-                OR message LIKE 'websocket event: {"type":"error","error":{"type":"usage_limit_reached"%'
+                {body_column} LIKE 'websocket event: {{"type":"codex.rate_limits"%'
+                OR {body_column} LIKE 'websocket event: {{"type":"error","error":{{"type":"usage_limit_reached"%'
               )
             ORDER BY id DESC
             """
@@ -391,7 +402,7 @@ def load_latest_usage_by_account(logs_path: Path) -> dict[str, UsageSnapshot]:
 
         latest_by_account: dict[str, UsageSnapshot] = {}
         for row in event_rows:
-            message = row["message"]
+            message = row["body"]
             if not isinstance(message, str) or not message.startswith(WS_EVENT_PREFIX):
                 continue
 
@@ -432,13 +443,14 @@ def load_local_usage_by_account(logs_path: Path, state_path: Path) -> dict[str, 
         logs_uri = f"file:{logs_path.as_posix()}?mode=ro"
         logs_connection = sqlite3.connect(logs_uri, uri=True)
         logs_connection.row_factory = sqlite3.Row
+        body_column = detect_log_body_column(logs_connection)
 
         request_rows = logs_connection.execute(
-            """
-            SELECT thread_id, ts, message
+            f"""
+            SELECT thread_id, ts, {body_column} AS body
             FROM logs
             WHERE target = 'log'
-              AND message LIKE ?
+              AND {body_column} LIKE ?
               AND thread_id IS NOT NULL
             ORDER BY id ASC
             """,
@@ -449,7 +461,7 @@ def load_local_usage_by_account(logs_path: Path, state_path: Path) -> dict[str, 
         account_last_seen: dict[str, int] = {}
         for row in request_rows:
             thread_id = row["thread_id"]
-            message = row["message"]
+            message = row["body"]
             if not isinstance(thread_id, str) or not isinstance(message, str):
                 continue
 
