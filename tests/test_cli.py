@@ -259,6 +259,19 @@ class SwitcherCliTests(unittest.TestCase):
         self.assertIn("Label: unmanaged", stdout)
         self.assertIn("Email: unmanaged@example.com", stdout)
 
+    def test_list_prefers_current_auth_plan_for_active_account(self) -> None:
+        write_auth_file(self.paths.auth_path, "account-1", "one@example.com", plan_type="free")
+        self.service.add_current_account("personal")
+        write_auth_file(self.paths.auth_path, "account-1", "one@example.com", plan_type="plus")
+
+        exit_code, stdout, stderr = self.run_cli("list")
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(stderr, "")
+        self.assertIn("personal", stdout)
+        self.assertIn("plus", stdout)
+        self.assertNotIn("free", stdout)
+
     def test_usage_parser_handles_rate_limits_event(self) -> None:
         create_logs_db(self.paths.logs_path)
         insert_log(
@@ -405,6 +418,22 @@ class SwitcherCliTests(unittest.TestCase):
         self.assertEqual(stderr, "")
         self.assertIn("personal", stdout)
         self.assertIn("unknown", stdout)
+
+    def test_list_shows_active_local_history_when_logs_cannot_map_account(self) -> None:
+        write_auth_file(self.paths.auth_path, "account-1", "one@example.com")
+        self.service.add_current_account("personal")
+        create_state_db(self.paths.state_path)
+        cutoff = 1_700_000_000
+        os.utime(self.paths.auth_path, (cutoff, cutoff))
+        insert_thread(self.paths.state_path, thread_id="thread-after", tokens_used=1200, updated_at=cutoff + 100)
+        insert_thread(self.paths.state_path, thread_id="thread-before", tokens_used=3000, updated_at=cutoff - 100)
+
+        exit_code, stdout, stderr = self.run_cli("list")
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(stderr, "")
+        self.assertIn("local history since active auth 1.2K", stdout)
+        self.assertNotIn("unknown", stdout)
 
     def test_usage_falls_back_to_local_thread_tokens(self) -> None:
         create_logs_db(self.paths.logs_path)
@@ -618,6 +647,22 @@ class SwitcherCliTests(unittest.TestCase):
         self.assertIn("Quota source: last known Codex websocket snapshot, not a live ChatGPT quota fetch.", stdout)
         self.assertIn("Local history source: local Codex thread history.", stdout)
         self.assertIn("Quota observed:", stdout)
+        self.assertIn("Local history observed:", stdout)
+
+    def test_status_reports_active_auth_local_history_source(self) -> None:
+        write_auth_file(self.paths.auth_path, "account-1", "one@example.com")
+        self.service.add_current_account("personal")
+        create_state_db(self.paths.state_path)
+        cutoff = 1_700_000_000
+        os.utime(self.paths.auth_path, (cutoff, cutoff))
+        insert_thread(self.paths.state_path, thread_id="thread-after", tokens_used=1200, updated_at=cutoff + 100)
+
+        exit_code, stdout, stderr = self.run_cli("status")
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(stderr, "")
+        self.assertIn("local history since active auth 1.2K", stdout)
+        self.assertIn("Local history source: threads updated since the current auth.json became active.", stdout)
         self.assertIn("Local history observed:", stdout)
 
     def test_local_usage_summary_shows_percentage_share(self) -> None:
