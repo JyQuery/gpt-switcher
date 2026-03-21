@@ -100,10 +100,16 @@ class UsageSnapshot:
 
 
 @dataclass(frozen=True)
+class AccountUsage:
+    quota_snapshot: UsageSnapshot | None = None
+    local_history_snapshot: UsageSnapshot | None = None
+
+
+@dataclass(frozen=True)
 class ActiveStatus:
     metadata: AuthMetadata | None
     saved_account: SavedAccount | None
-    usage: UsageSnapshot | None
+    usage: AccountUsage | None
 
 
 def normalize_label(label: str) -> str:
@@ -554,15 +560,20 @@ def load_local_usage_by_account(logs_path: Path, state_path: Path) -> dict[str, 
             state_connection.close()
 
 
-def load_usage_by_account(logs_path: Path, state_path: Path | None = None) -> dict[str, UsageSnapshot]:
-    usage = load_latest_usage_by_account(logs_path)
+def load_usage_by_account(logs_path: Path, state_path: Path | None = None) -> dict[str, AccountUsage]:
+    usage = {
+        account_id: AccountUsage(quota_snapshot=snapshot)
+        for account_id, snapshot in load_latest_usage_by_account(logs_path).items()
+    }
     if state_path is None:
         return usage
 
     for account_id, local_snapshot in load_local_usage_by_account(logs_path, state_path).items():
-        remote_snapshot = usage.get(account_id)
-        if remote_snapshot is None or local_snapshot.observed_at > remote_snapshot.observed_at:
-            usage[account_id] = local_snapshot
+        existing = usage.get(account_id)
+        if existing is None:
+            usage[account_id] = AccountUsage(local_history_snapshot=local_snapshot)
+            continue
+        usage[account_id] = replace(existing, local_history_snapshot=local_snapshot)
 
     return usage
 
@@ -570,7 +581,7 @@ def load_usage_by_account(logs_path: Path, state_path: Path | None = None) -> di
 def format_timestamp(timestamp: int | None) -> str:
     if timestamp is None:
         return "unknown"
-    return datetime.fromtimestamp(timestamp).astimezone().strftime("%Y-%m-%d %H:%M")
+    return datetime.fromtimestamp(timestamp, tz=UTC).astimezone().strftime("%Y-%m-%d %H:%M")
 
 
 def format_token_count(tokens: int | None) -> str:
@@ -587,25 +598,55 @@ def format_token_count(tokens: int | None) -> str:
     return f"{tokens:,}"
 
 
-def summarize_usage(snapshot: UsageSnapshot | None) -> str:
-    if snapshot is None:
-        return "unknown"
+def format_window_label(window_minutes: int | None, fallback: str) -> str:
+    if window_minutes is None:
+        return fallback
+    if window_minutes % 10080 == 0 and window_minutes >= 10080:
+        weeks = window_minutes // 10080
+        return "1w" if weeks == 1 else f"{weeks}w"
+    if window_minutes % 1440 == 0 and window_minutes >= 1440:
+        days = window_minutes // 1440
+        return "1d" if days == 1 else f"{days}d"
+    if window_minutes % 60 == 0 and window_minutes >= 60:
+        hours = window_minutes // 60
+        return "1h" if hours == 1 else f"{hours}h"
+    return f"{window_minutes}m"
 
-    if snapshot.source == "local_threads":
-        token_text = format_token_count(snapshot.local_tokens_used)
-        thread_text = str(snapshot.local_thread_count) if snapshot.local_thread_count is not None else "?"
-        share_text = (
-            f"{snapshot.local_share_percent:.1f}%"
-            if snapshot.local_share_percent is not None
-            else "?"
-        )
-        return f"local history {token_text} ({share_text}, {thread_text} threads, last {format_timestamp(snapshot.observed_at)})"
 
-    status = "reached" if snapshot.limit_reached else "available"
+def summarize_quota_snapshot(snapshot: UsageSnapshot) -> str:
+    primary_label = format_window_label(snapshot.primary_window_minutes, "primary")
+    secondary_label = format_window_label(snapshot.secondary_window_minutes, "secondary")
     primary = f"{snapshot.primary_used_percent}%" if snapshot.primary_used_percent is not None else "?"
     secondary = f"{snapshot.secondary_used_percent}%" if snapshot.secondary_used_percent is not None else "?"
     reset_at = snapshot.primary_reset_at or snapshot.secondary_reset_at
-    return f"{status} p:{primary} s:{secondary} reset:{format_timestamp(reset_at)}"
+    reached_text = " reached" if snapshot.limit_reached else ""
+    return (
+        f"last-known quota{reached_text} {primary_label}:{primary} {secondary_label}:{secondary} "
+        f"reset:{format_timestamp(reset_at)} seen:{format_timestamp(snapshot.observed_at)}"
+    )
+
+
+def summarize_local_history_snapshot(snapshot: UsageSnapshot) -> str:
+    token_text = format_token_count(snapshot.local_tokens_used)
+    thread_text = str(snapshot.local_thread_count) if snapshot.local_thread_count is not None else "?"
+    share_text = (
+        f"{snapshot.local_share_percent:.1f}%"
+        if snapshot.local_share_percent is not None
+        else "?"
+    )
+    return f"local history {token_text} ({share_text}, {thread_text} threads, last {format_timestamp(snapshot.observed_at)})"
+
+
+def summarize_usage(usage: AccountUsage | None) -> str:
+    if usage is None:
+        return "unknown"
+
+    parts: list[str] = []
+    if usage.quota_snapshot is not None:
+        parts.append(summarize_quota_snapshot(usage.quota_snapshot))
+    if usage.local_history_snapshot is not None:
+        parts.append(summarize_local_history_snapshot(usage.local_history_snapshot))
+    return "; ".join(parts) if parts else "unknown"
 
 
 def short_account_id(account_id: str) -> str:
@@ -726,7 +767,7 @@ class SwitcherService:
         usage = self.load_usage().get(metadata.account_id)
         return ActiveStatus(metadata=metadata, saved_account=saved_account, usage=usage)
 
-    def load_usage(self) -> dict[str, UsageSnapshot]:
+    def load_usage(self) -> dict[str, AccountUsage]:
         return load_usage_by_account(self.paths.logs_path, self.paths.state_path)
 
     def _load_registry(self) -> dict[str, SavedAccount]:

@@ -24,7 +24,7 @@ def build_parser() -> argparse.ArgumentParser:
     add_parser = subparsers.add_parser("add", help="Save the current Codex account under a label.")
     add_parser.add_argument("label", help="Human-friendly label for the current account.")
 
-    subparsers.add_parser("list", help="List saved accounts and their last-known Codex usage.")
+    subparsers.add_parser("list", help="List saved accounts with last-known Codex quota snapshots and local history.")
 
     switch_parser = subparsers.add_parser("switch", help="Make a saved account the active Codex login.")
     switch_parser.add_argument("label", help="Label of the saved account to activate.")
@@ -87,10 +87,13 @@ def command_status(service: SwitcherService) -> int:
     if status.metadata.token_expires_at is not None:
         print(f"Access token expires: {format_timestamp(status.metadata.token_expires_at)}")
     print(f"Usage: {summarize_usage(status.usage)}")
-    if status.usage is not None and status.usage.source == "local_threads":
-        print("Usage source: local Codex thread history, not live ChatGPT quota.")
     if status.usage is not None:
-        print(f"Usage observed: {format_timestamp(status.usage.observed_at)}")
+        if status.usage.quota_snapshot is not None:
+            print("Quota source: last known Codex websocket snapshot, not a live ChatGPT quota fetch.")
+            print(f"Quota observed: {format_timestamp(status.usage.quota_snapshot.observed_at)}")
+        if status.usage.local_history_snapshot is not None:
+            print("Local history source: local Codex thread history.")
+            print(f"Local history observed: {format_timestamp(status.usage.local_history_snapshot.observed_at)}")
     return 0
 
 
