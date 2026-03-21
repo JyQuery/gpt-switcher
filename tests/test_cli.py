@@ -428,7 +428,10 @@ class SwitcherCliTests(unittest.TestCase):
 
         usage = load_usage_by_account(self.paths.logs_path, self.paths.state_path)
 
-        snapshot = usage["account-local"]
+        self.assertIsNone(usage["account-local"].quota_snapshot)
+        snapshot = usage["account-local"].local_history_snapshot
+        self.assertIsNotNone(snapshot)
+        assert snapshot is not None
         self.assertEqual(snapshot.source, "local_threads")
         self.assertEqual(snapshot.local_tokens_used, 3500)
         self.assertEqual(snapshot.local_thread_count, 2)
@@ -456,13 +459,16 @@ class SwitcherCliTests(unittest.TestCase):
 
         usage = load_usage_by_account(self.paths.logs_path, self.paths.state_path)
 
-        snapshot = usage["account-local"]
+        self.assertIsNone(usage["account-local"].quota_snapshot)
+        snapshot = usage["account-local"].local_history_snapshot
+        self.assertIsNotNone(snapshot)
+        assert snapshot is not None
         self.assertEqual(snapshot.source, "local_threads")
         self.assertEqual(snapshot.local_tokens_used, 3500)
         self.assertEqual(snapshot.local_thread_count, 2)
         self.assertEqual(snapshot.observed_at, 777)
 
-    def test_newer_local_usage_overrides_older_rate_limit_snapshot(self) -> None:
+    def test_usage_retains_last_known_quota_and_local_history_snapshots(self) -> None:
         create_logs_db(self.paths.logs_path)
         create_state_db(self.paths.state_path)
         insert_log(
@@ -507,10 +513,112 @@ class SwitcherCliTests(unittest.TestCase):
 
         usage = load_usage_by_account(self.paths.logs_path, self.paths.state_path)
 
-        snapshot = usage["account-1"]
-        self.assertEqual(snapshot.source, "local_threads")
-        self.assertEqual(snapshot.local_tokens_used, 4200)
-        self.assertEqual(snapshot.observed_at, 300)
+        quota_snapshot = usage["account-1"].quota_snapshot
+        local_snapshot = usage["account-1"].local_history_snapshot
+        self.assertIsNotNone(quota_snapshot)
+        self.assertIsNotNone(local_snapshot)
+        assert quota_snapshot is not None
+        assert local_snapshot is not None
+        self.assertEqual(quota_snapshot.source, "rate_limits")
+        self.assertEqual(quota_snapshot.primary_used_percent, 5)
+        self.assertEqual(quota_snapshot.observed_at, 110)
+        self.assertEqual(local_snapshot.source, "local_threads")
+        self.assertEqual(local_snapshot.local_tokens_used, 4200)
+        self.assertEqual(local_snapshot.observed_at, 300)
+
+    def test_list_shows_last_known_quota_and_local_history(self) -> None:
+        write_auth_file(self.paths.auth_path, "account-1", "one@example.com")
+        self.service.add_current_account("personal")
+        create_logs_db(self.paths.logs_path)
+        create_state_db(self.paths.state_path)
+        insert_log(
+            self.paths.logs_path,
+            ts=100,
+            target="log",
+            message=request_message("account-1"),
+            thread_id="thread-1",
+        )
+        insert_log(
+            self.paths.logs_path,
+            ts=110,
+            target="codex_api::endpoint::responses_websocket",
+            message=websocket_event(
+                {
+                    "type": "codex.rate_limits",
+                    "plan_type": "plus",
+                    "rate_limits": {
+                        "primary": {
+                            "used_percent": 5,
+                            "window_minutes": 300,
+                            "reset_at": 1773969965,
+                        },
+                        "secondary": {
+                            "used_percent": 30,
+                            "window_minutes": 10080,
+                            "reset_at": 1774569999,
+                        },
+                    },
+                }
+            ),
+            thread_id="thread-1",
+        )
+        insert_thread(self.paths.state_path, thread_id="thread-1", tokens_used=4200, updated_at=300)
+
+        exit_code, stdout, stderr = self.run_cli("list")
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(stderr, "")
+        self.assertIn("last-known quota", stdout)
+        self.assertIn("5h:5%", stdout)
+        self.assertIn("1w:30%", stdout)
+        self.assertIn("local history 4.2K", stdout)
+
+    def test_status_reports_quota_and_local_history_sources(self) -> None:
+        write_auth_file(self.paths.auth_path, "account-1", "one@example.com")
+        self.service.add_current_account("personal")
+        create_logs_db(self.paths.logs_path)
+        create_state_db(self.paths.state_path)
+        insert_log(
+            self.paths.logs_path,
+            ts=100,
+            target="log",
+            message=request_message("account-1"),
+            thread_id="thread-1",
+        )
+        insert_log(
+            self.paths.logs_path,
+            ts=110,
+            target="codex_api::endpoint::responses_websocket",
+            message=websocket_event(
+                {
+                    "type": "codex.rate_limits",
+                    "plan_type": "plus",
+                    "rate_limits": {
+                        "primary": {
+                            "used_percent": 5,
+                            "window_minutes": 300,
+                            "reset_at": 1773969965,
+                        },
+                        "secondary": {
+                            "used_percent": 30,
+                            "window_minutes": 10080,
+                            "reset_at": 1774569999,
+                        },
+                    },
+                }
+            ),
+            thread_id="thread-1",
+        )
+        insert_thread(self.paths.state_path, thread_id="thread-1", tokens_used=4200, updated_at=300)
+
+        exit_code, stdout, stderr = self.run_cli("status")
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(stderr, "")
+        self.assertIn("Quota source: last known Codex websocket snapshot, not a live ChatGPT quota fetch.", stdout)
+        self.assertIn("Local history source: local Codex thread history.", stdout)
+        self.assertIn("Quota observed:", stdout)
+        self.assertIn("Local history observed:", stdout)
 
     def test_local_usage_summary_shows_percentage_share(self) -> None:
         create_logs_db(self.paths.logs_path)
