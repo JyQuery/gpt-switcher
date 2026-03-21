@@ -560,6 +560,59 @@ def load_local_usage_by_account(logs_path: Path, state_path: Path) -> dict[str, 
             state_connection.close()
 
 
+def load_recent_local_usage_since(state_path: Path, observed_after: int) -> UsageSnapshot | None:
+    if not state_path.exists():
+        return None
+
+    state_connection: sqlite3.Connection | None = None
+    try:
+        state_uri = f"file:{state_path.as_posix()}?mode=ro"
+        state_connection = sqlite3.connect(state_uri, uri=True)
+        state_connection.row_factory = sqlite3.Row
+        row = state_connection.execute(
+            """
+            SELECT
+                COUNT(*) AS thread_count,
+                COALESCE(SUM(tokens_used), 0) AS total_tokens,
+                MAX(updated_at) AS last_updated
+            FROM threads
+            WHERE updated_at >= ?
+            """,
+            (observed_after,),
+        ).fetchone()
+        if row is None:
+            return None
+
+        thread_count = parse_int(row["thread_count"])
+        total_tokens = parse_int(row["total_tokens"])
+        observed_at = parse_int(row["last_updated"])
+        if not thread_count or observed_at is None:
+            return None
+
+        return UsageSnapshot(
+            observed_at=observed_at,
+            source="active_auth_local_threads",
+            plan_type=None,
+            limit_reached=False,
+            primary_used_percent=None,
+            secondary_used_percent=None,
+            primary_window_minutes=None,
+            secondary_window_minutes=None,
+            primary_reset_at=None,
+            secondary_reset_at=None,
+            credits_has_credits=None,
+            credits_balance=None,
+            credits_unlimited=None,
+            local_tokens_used=total_tokens,
+            local_thread_count=thread_count,
+        )
+    except sqlite3.DatabaseError:
+        return None
+    finally:
+        if state_connection is not None:
+            state_connection.close()
+
+
 def load_usage_by_account(logs_path: Path, state_path: Path | None = None) -> dict[str, AccountUsage]:
     usage = {
         account_id: AccountUsage(quota_snapshot=snapshot)
@@ -629,6 +682,9 @@ def summarize_quota_snapshot(snapshot: UsageSnapshot) -> str:
 def summarize_local_history_snapshot(snapshot: UsageSnapshot) -> str:
     token_text = format_token_count(snapshot.local_tokens_used)
     thread_text = str(snapshot.local_thread_count) if snapshot.local_thread_count is not None else "?"
+    if snapshot.source == "active_auth_local_threads":
+        return f"local history since active auth {token_text} ({thread_text} threads, last {format_timestamp(snapshot.observed_at)})"
+
     share_text = (
         f"{snapshot.local_share_percent:.1f}%"
         if snapshot.local_share_percent is not None
@@ -753,6 +809,35 @@ class SwitcherService:
         auth_payload, _ = read_json_file(self.paths.auth_path)
         return extract_auth_metadata(auth_payload)
 
+    def active_auth_observed_at(self) -> int | None:
+        if not self.paths.auth_path.exists():
+            return None
+        try:
+            return int(self.paths.auth_path.stat().st_mtime)
+        except OSError:
+            return None
+
+    def augment_usage_with_active_history(
+        self,
+        metadata: AuthMetadata | None,
+        usage: AccountUsage | None,
+    ) -> AccountUsage | None:
+        if metadata is None:
+            return usage
+        if usage is not None and usage.local_history_snapshot is not None:
+            return usage
+
+        observed_after = self.active_auth_observed_at()
+        if observed_after is None:
+            return usage
+
+        fallback_snapshot = load_recent_local_usage_since(self.paths.state_path, observed_after)
+        if fallback_snapshot is None:
+            return usage
+        if usage is None:
+            return AccountUsage(local_history_snapshot=fallback_snapshot)
+        return replace(usage, local_history_snapshot=fallback_snapshot)
+
     def get_active_status(self) -> ActiveStatus:
         metadata = self.try_read_current_auth()
         if metadata is None:
@@ -764,7 +849,10 @@ class SwitcherService:
                 saved_account = account
                 break
 
-        usage = self.load_usage().get(metadata.account_id)
+        usage = self.augment_usage_with_active_history(
+            metadata,
+            self.load_usage().get(metadata.account_id),
+        )
         return ActiveStatus(metadata=metadata, saved_account=saved_account, usage=usage)
 
     def load_usage(self) -> dict[str, AccountUsage]:

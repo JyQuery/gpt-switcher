@@ -47,17 +47,43 @@ def command_list(service: SwitcherService) -> int:
 
     active = service.try_read_current_auth()
     usage_by_account = service.load_usage()
+    active_auth_observed_at = service.active_auth_observed_at()
+    if active is not None:
+        active_usage = service.augment_usage_with_active_history(active, usage_by_account.get(active.account_id))
+        if active_usage is not None:
+            usage_by_account = dict(usage_by_account)
+            usage_by_account[active.account_id] = active_usage
+
     rows: list[list[str]] = []
     for account in accounts:
         active_marker = "*" if active is not None and active.account_id == account.account_id else ""
+        usage = usage_by_account.get(account.account_id)
+        email = active.email if active is not None and active.account_id == account.account_id else account.email
+        plan = account.plan_type
+        if usage is not None and usage.quota_snapshot is not None and usage.quota_snapshot.plan_type:
+            plan = usage.quota_snapshot.plan_type
+        if (
+            active is not None
+            and active.account_id == account.account_id
+            and active.plan_type != "unknown"
+            and (
+                usage is None
+                or usage.quota_snapshot is None
+                or usage.quota_snapshot.plan_type is None
+                or active_auth_observed_at is None
+                or active_auth_observed_at >= usage.quota_snapshot.observed_at
+            )
+        ):
+            plan = active.plan_type
+
         rows.append(
             [
                 active_marker,
                 account.label,
-                account.email,
-                account.plan_type,
+                email,
+                plan,
                 short_account_id(account.account_id),
-                summarize_usage(usage_by_account.get(account.account_id)),
+                summarize_usage(usage),
             ]
         )
 
@@ -92,7 +118,10 @@ def command_status(service: SwitcherService) -> int:
             print("Quota source: last known Codex websocket snapshot, not a live ChatGPT quota fetch.")
             print(f"Quota observed: {format_timestamp(status.usage.quota_snapshot.observed_at)}")
         if status.usage.local_history_snapshot is not None:
-            print("Local history source: local Codex thread history.")
+            if status.usage.local_history_snapshot.source == "active_auth_local_threads":
+                print("Local history source: threads updated since the current auth.json became active.")
+            else:
+                print("Local history source: local Codex thread history.")
             print(f"Local history observed: {format_timestamp(status.usage.local_history_snapshot.observed_at)}")
     return 0
 
