@@ -171,6 +171,13 @@ def request_message(account_id: str) -> str:
     )
 
 
+def otel_account_message(account_id: str, email: str = "user@example.com") -> str:
+    return (
+        'event.name="codex.user_prompt" auth_mode="Chatgpt" '
+        f'user.account_id="{account_id}" user.email="{email}"'
+    )
+
+
 def websocket_event(payload: dict) -> str:
     return "websocket event: " + json.dumps(payload, separators=(",", ":"))
 
@@ -346,6 +353,48 @@ class SwitcherCliTests(unittest.TestCase):
         self.assertEqual(snapshot.primary_reset_at, 1773969962)
         self.assertEqual(snapshot.credits_balance, "0")
 
+    def test_usage_parser_maps_rate_limits_from_otel_account_rows(self) -> None:
+        create_logs_db(self.paths.logs_path)
+        insert_log(
+            self.paths.logs_path,
+            ts=100,
+            target="codex_otel.log_only",
+            message=otel_account_message("account-otel"),
+            thread_id="thread-otel",
+        )
+        insert_log(
+            self.paths.logs_path,
+            ts=110,
+            target="codex_api::endpoint::responses_websocket",
+            message=websocket_event(
+                {
+                    "type": "codex.rate_limits",
+                    "plan_type": "plus",
+                    "rate_limits": {
+                        "primary": {
+                            "used_percent": 21,
+                            "window_minutes": 300,
+                            "reset_at": 1773969965,
+                        },
+                        "secondary": {
+                            "used_percent": 55,
+                            "window_minutes": 10080,
+                            "reset_at": 1774569999,
+                        },
+                    },
+                    "credits": {"has_credits": True, "balance": "12"},
+                }
+            ),
+            thread_id="thread-otel",
+        )
+
+        usage = load_latest_usage_by_account(self.paths.logs_path)
+
+        snapshot = usage["account-otel"]
+        self.assertEqual(snapshot.source, "rate_limits")
+        self.assertEqual(snapshot.primary_used_percent, 21)
+        self.assertEqual(snapshot.secondary_used_percent, 55)
+
     def test_list_shows_unknown_usage_when_no_logs_exist(self) -> None:
         write_auth_file(self.paths.auth_path, "account-1", "one@example.com")
         self.service.add_current_account("personal")
@@ -384,6 +433,84 @@ class SwitcherCliTests(unittest.TestCase):
         self.assertEqual(snapshot.local_tokens_used, 3500)
         self.assertEqual(snapshot.local_thread_count, 2)
         self.assertEqual(snapshot.observed_at, 777)
+
+    def test_usage_falls_back_to_local_thread_tokens_from_otel_account_rows(self) -> None:
+        create_logs_db(self.paths.logs_path)
+        create_state_db(self.paths.state_path)
+        insert_log(
+            self.paths.logs_path,
+            ts=300,
+            target="codex_otel.log_only",
+            message=otel_account_message("account-local"),
+            thread_id="thread-local-1",
+        )
+        insert_log(
+            self.paths.logs_path,
+            ts=301,
+            target="codex_otel.log_only",
+            message=otel_account_message("account-local"),
+            thread_id="thread-local-2",
+        )
+        insert_thread(self.paths.state_path, thread_id="thread-local-1", tokens_used=1000, updated_at=555)
+        insert_thread(self.paths.state_path, thread_id="thread-local-2", tokens_used=2500, updated_at=777)
+
+        usage = load_usage_by_account(self.paths.logs_path, self.paths.state_path)
+
+        snapshot = usage["account-local"]
+        self.assertEqual(snapshot.source, "local_threads")
+        self.assertEqual(snapshot.local_tokens_used, 3500)
+        self.assertEqual(snapshot.local_thread_count, 2)
+        self.assertEqual(snapshot.observed_at, 777)
+
+    def test_newer_local_usage_overrides_older_rate_limit_snapshot(self) -> None:
+        create_logs_db(self.paths.logs_path)
+        create_state_db(self.paths.state_path)
+        insert_log(
+            self.paths.logs_path,
+            ts=100,
+            target="codex_otel.log_only",
+            message=otel_account_message("account-1"),
+            thread_id="thread-remote",
+        )
+        insert_log(
+            self.paths.logs_path,
+            ts=110,
+            target="codex_api::endpoint::responses_websocket",
+            message=websocket_event(
+                {
+                    "type": "codex.rate_limits",
+                    "plan_type": "plus",
+                    "rate_limits": {
+                        "primary": {
+                            "used_percent": 5,
+                            "window_minutes": 300,
+                            "reset_at": 1773969965,
+                        },
+                        "secondary": {
+                            "used_percent": 30,
+                            "window_minutes": 10080,
+                            "reset_at": 1774569999,
+                        },
+                    },
+                }
+            ),
+            thread_id="thread-remote",
+        )
+        insert_log(
+            self.paths.logs_path,
+            ts=200,
+            target="codex_otel.log_only",
+            message=otel_account_message("account-1"),
+            thread_id="thread-local",
+        )
+        insert_thread(self.paths.state_path, thread_id="thread-local", tokens_used=4200, updated_at=300)
+
+        usage = load_usage_by_account(self.paths.logs_path, self.paths.state_path)
+
+        snapshot = usage["account-1"]
+        self.assertEqual(snapshot.source, "local_threads")
+        self.assertEqual(snapshot.local_tokens_used, 4200)
+        self.assertEqual(snapshot.observed_at, 300)
 
     def test_local_usage_summary_shows_percentage_share(self) -> None:
         create_logs_db(self.paths.logs_path)

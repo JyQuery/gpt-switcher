@@ -17,6 +17,7 @@ REQUEST_MESSAGE_PREFIX = 'Request: "GET /backend-api/codex/responses HTTP/1.1'
 WS_EVENT_PREFIX = "websocket event: "
 
 ACCOUNT_ID_PATTERN = re.compile(r"chatgpt-account-id:\s*(.+?)(?:\\r\\n|[\r\n]|$)")
+OTEL_ACCOUNT_ID_PATTERN = re.compile(r'user\.account_id="([^"]+)"')
 SAFE_LABEL_PATTERN = re.compile(r"[^A-Za-z0-9._-]+")
 
 
@@ -253,6 +254,72 @@ def detect_log_body_column(connection: sqlite3.Connection) -> str:
     raise sqlite3.DatabaseError("logs table is missing both message and feedback_log_body columns.")
 
 
+def extract_account_id_from_log_message(message: str) -> str | None:
+    match = ACCOUNT_ID_PATTERN.search(message)
+    if match:
+        return match.group(1).strip()
+
+    match = OTEL_ACCOUNT_ID_PATTERN.search(message)
+    if match:
+        return match.group(1).strip()
+
+    return None
+
+
+def load_account_mappings(
+    connection: sqlite3.Connection,
+) -> tuple[str, dict[str, str], dict[str, list[tuple[int, str]]], dict[str, set[str]], dict[str, int]]:
+    body_column = detect_log_body_column(connection)
+    rows = connection.execute(
+        f"""
+        SELECT id, ts, thread_id, process_uuid, {body_column} AS body
+        FROM logs
+        WHERE (
+            target = 'log'
+            AND {body_column} LIKE ?
+        ) OR (
+            target IN ('codex_otel.log_only', 'codex_otel.trace_safe')
+            AND thread_id IS NOT NULL
+            AND {body_column} LIKE ?
+        )
+        ORDER BY id ASC
+        """,
+        (f"{REQUEST_MESSAGE_PREFIX}%", '%user.account_id="%"%'),
+    ).fetchall()
+
+    thread_to_account: dict[str, str] = {}
+    process_to_requests: dict[str, list[tuple[int, str]]] = {}
+    account_threads: dict[str, set[str]] = {}
+    account_last_seen: dict[str, int] = {}
+    for row in rows:
+        message = row["body"]
+        if not isinstance(message, str):
+            continue
+
+        account_id = extract_account_id_from_log_message(message)
+        if not account_id:
+            continue
+
+        thread_id = row["thread_id"]
+        if isinstance(thread_id, str) and thread_id:
+            thread_to_account[thread_id] = account_id
+            account_threads.setdefault(account_id, set()).add(thread_id)
+
+        process_uuid = row["process_uuid"]
+        if isinstance(process_uuid, str) and process_uuid:
+            process_to_requests.setdefault(process_uuid, []).append((int(row["id"]), account_id))
+
+        ts_value = parse_int(row["ts"])
+        if ts_value is None:
+            continue
+
+        previous = account_last_seen.get(account_id)
+        if previous is None or ts_value > previous:
+            account_last_seen[account_id] = ts_value
+
+    return body_column, thread_to_account, process_to_requests, account_threads, account_last_seen
+
+
 def resolve_account_id(
     event_id: int,
     thread_id: Any,
@@ -355,38 +422,7 @@ def load_latest_usage_by_account(logs_path: Path) -> dict[str, UsageSnapshot]:
         uri = f"file:{logs_path.as_posix()}?mode=ro"
         connection = sqlite3.connect(uri, uri=True)
         connection.row_factory = sqlite3.Row
-        body_column = detect_log_body_column(connection)
-
-        request_rows = connection.execute(
-            f"""
-            SELECT id, thread_id, process_uuid, {body_column} AS body
-            FROM logs
-            WHERE target = 'log'
-              AND {body_column} LIKE ?
-            ORDER BY id ASC
-            """,
-            (f"{REQUEST_MESSAGE_PREFIX}%",),
-        ).fetchall()
-
-        thread_to_account: dict[str, str] = {}
-        process_to_requests: dict[str, list[tuple[int, str]]] = {}
-        for row in request_rows:
-            message = row["body"]
-            if not isinstance(message, str):
-                continue
-
-            match = ACCOUNT_ID_PATTERN.search(message)
-            if not match:
-                continue
-
-            account_id = match.group(1)
-            thread_id = row["thread_id"]
-            if isinstance(thread_id, str) and thread_id:
-                thread_to_account[thread_id] = account_id
-
-            process_uuid = row["process_uuid"]
-            if isinstance(process_uuid, str) and process_uuid:
-                process_to_requests.setdefault(process_uuid, []).append((int(row["id"]), account_id))
+        body_column, thread_to_account, process_to_requests, _, _ = load_account_mappings(connection)
 
         event_rows = connection.execute(
             f"""
@@ -444,39 +480,7 @@ def load_local_usage_by_account(logs_path: Path, state_path: Path) -> dict[str, 
         logs_uri = f"file:{logs_path.as_posix()}?mode=ro"
         logs_connection = sqlite3.connect(logs_uri, uri=True)
         logs_connection.row_factory = sqlite3.Row
-        body_column = detect_log_body_column(logs_connection)
-
-        request_rows = logs_connection.execute(
-            f"""
-            SELECT thread_id, ts, {body_column} AS body
-            FROM logs
-            WHERE target = 'log'
-              AND {body_column} LIKE ?
-              AND thread_id IS NOT NULL
-            ORDER BY id ASC
-            """,
-            (f"{REQUEST_MESSAGE_PREFIX}%",),
-        ).fetchall()
-
-        account_threads: dict[str, set[str]] = {}
-        account_last_seen: dict[str, int] = {}
-        for row in request_rows:
-            thread_id = row["thread_id"]
-            message = row["body"]
-            if not isinstance(thread_id, str) or not isinstance(message, str):
-                continue
-
-            match = ACCOUNT_ID_PATTERN.search(message)
-            if not match:
-                continue
-
-            account_id = match.group(1).strip()
-            account_threads.setdefault(account_id, set()).add(thread_id)
-            ts_value = row["ts"]
-            if isinstance(ts_value, int):
-                previous = account_last_seen.get(account_id)
-                if previous is None or ts_value > previous:
-                    account_last_seen[account_id] = ts_value
+        _, _, _, account_threads, account_last_seen = load_account_mappings(logs_connection)
 
         if not account_threads:
             return {}
@@ -556,7 +560,9 @@ def load_usage_by_account(logs_path: Path, state_path: Path | None = None) -> di
         return usage
 
     for account_id, local_snapshot in load_local_usage_by_account(logs_path, state_path).items():
-        usage.setdefault(account_id, local_snapshot)
+        remote_snapshot = usage.get(account_id)
+        if remote_snapshot is None or local_snapshot.observed_at > remote_snapshot.observed_at:
+            usage[account_id] = local_snapshot
 
     return usage
 
