@@ -25,7 +25,7 @@ REFRESH_TOKEN_URL = "https://auth.openai.com/oauth/token"
 REFRESH_TOKEN_URL_OVERRIDE_ENV_VAR = "CODEX_REFRESH_TOKEN_URL_OVERRIDE"
 REFRESH_TOKEN_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
 HTTP_TIMEOUT_SECONDS = 15
-USER_AGENT = "gpt-switcher"
+USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36"
 
 ACCOUNT_ID_PATTERN = re.compile(r"chatgpt-account-id:\s*(.+?)(?:\\r\\n|[\r\n]|$)")
 OTEL_ACCOUNT_ID_PATTERN = re.compile(r'user\.account_id="([^"]+)"')
