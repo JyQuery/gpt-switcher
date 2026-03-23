@@ -32,13 +32,19 @@ def jwt_segment(payload: dict) -> str:
     return encoded.decode("ascii")
 
 
-def build_access_token(account_id: str, email: str, plan_type: str = "plus") -> str:
+def build_access_token(
+    account_id: str,
+    email: str,
+    plan_type: str = "plus",
+    *,
+    user_id: str | None = None,
+) -> str:
     header = {"alg": "none", "typ": "JWT"}
     payload = {
         "https://api.openai.com/auth": {
             "chatgpt_account_id": account_id,
             "chatgpt_plan_type": plan_type,
-            "chatgpt_user_id": f"user-{account_id}",
+            "chatgpt_user_id": user_id or f"user-{account_id}",
         },
         "https://api.openai.com/profile": {
             "email": email,
@@ -50,14 +56,21 @@ def build_access_token(account_id: str, email: str, plan_type: str = "plus") -> 
     return f"{jwt_segment(header)}.{jwt_segment(payload)}."
 
 
-def write_auth_file(path: Path, account_id: str, email: str, plan_type: str = "plus") -> None:
+def write_auth_file(
+    path: Path,
+    account_id: str,
+    email: str,
+    plan_type: str = "plus",
+    *,
+    user_id: str | None = None,
+) -> None:
     payload = {
         "auth_mode": "chatgpt",
         "last_refresh": "2026-03-20T00:00:00Z",
         "OPENAI_API_KEY": None,
         "tokens": {
             "id_token": "id-token",
-            "access_token": build_access_token(account_id, email, plan_type),
+            "access_token": build_access_token(account_id, email, plan_type, user_id=user_id),
             "refresh_token": "refresh-token",
             "account_id": account_id,
         },
@@ -242,6 +255,128 @@ class SwitcherCliTests(unittest.TestCase):
 
         with self.assertRaises(SwitcherError):
             self.service.add_current_account("work")
+
+    def test_add_allows_distinct_team_members_with_shared_account_id(self) -> None:
+        write_auth_file(self.paths.auth_path, "team-account", "one@example.com", "team", user_id="user-1")
+        self.service.add_current_account("one")
+
+        write_auth_file(self.paths.auth_path, "team-account", "two@example.com", "team", user_id="user-2")
+        saved = self.service.add_current_account("two")
+
+        self.assertEqual(saved.user_id, "user-2")
+        registry = json.loads(self.paths.registry_path.read_text(encoding="utf-8"))
+        self.assertEqual(
+            [(entry["label"], entry["account_id"], entry["user_id"]) for entry in registry["accounts"]],
+            [
+                ("one", "team-account", "user-1"),
+                ("two", "team-account", "user-2"),
+            ],
+        )
+
+    def test_add_restores_missing_user_id_from_saved_snapshot(self) -> None:
+        write_auth_file(self.paths.auth_path, "team-account", "one@example.com", "team", user_id="user-1")
+        saved = self.service.add_current_account("one")
+
+        registry = json.loads(self.paths.registry_path.read_text(encoding="utf-8"))
+        del registry["accounts"][0]["user_id"]
+        self.paths.registry_path.write_text(json.dumps(registry), encoding="utf-8")
+
+        write_auth_file(self.paths.auth_path, "team-account", "two@example.com", "team", user_id="user-2")
+        added = self.service.add_current_account("two")
+
+        self.assertEqual(added.user_id, "user-2")
+        loaded = {account.label: account for account in self.service.list_accounts()}
+        self.assertEqual(loaded["one"].user_id, "user-1")
+        self.assertEqual(loaded["one"].snapshot_name, saved.snapshot_name)
+        self.assertEqual(loaded["two"].user_id, "user-2")
+
+    def test_list_marks_only_matching_team_member_as_active(self) -> None:
+        write_auth_file(self.paths.auth_path, "team-account", "one@example.com", "team", user_id="user-1")
+        self.service.add_current_account("one")
+
+        write_auth_file(self.paths.auth_path, "team-account", "two@example.com", "team", user_id="user-2")
+        self.service.add_current_account("two")
+
+        exit_code, stdout, stderr = self.run_cli("list")
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(stderr, "")
+        active_rows = [line for line in stdout.splitlines() if line.startswith("*")]
+        self.assertEqual(len(active_rows), 1)
+        self.assertIn("two", active_rows[0])
+        self.assertNotIn("one", active_rows[0])
+
+    def test_load_usage_fresh_keeps_active_team_member_auth_snapshot(self) -> None:
+        write_auth_file(self.paths.auth_path, "team-account", "one@example.com", "team", user_id="user-1")
+        saved_one = self.service.add_current_account("one")
+
+        write_auth_file(self.paths.auth_path, "team-account", "two@example.com", "team", user_id="user-2")
+        saved_two = self.service.add_current_account("two")
+        self.service.switch_account("one")
+
+        refreshed_tokens = {
+            "user-1": build_access_token("team-account", "one@example.com", "team", user_id="user-1"),
+            "user-2": build_access_token("team-account", "two@example.com", "team", user_id="user-2"),
+        }
+
+        def fake_json_request(
+            url: str,
+            *,
+            headers: dict[str, str] | None = None,
+            payload: dict | None = None,
+            timeout_seconds: int = 15,
+        ) -> dict:
+            del timeout_seconds
+            if url.endswith("/oauth/token"):
+                assert payload is not None
+                access_token = payload.get("refresh_token")
+                if access_token == "refresh-token-user-1":
+                    return {
+                        "access_token": refreshed_tokens["user-1"],
+                        "refresh_token": "refresh-token-user-1",
+                    }
+                if access_token == "refresh-token-user-2":
+                    return {
+                        "access_token": refreshed_tokens["user-2"],
+                        "refresh_token": "refresh-token-user-2",
+                    }
+                raise AssertionError(f"unexpected refresh token {access_token}")
+            if url.endswith("/wham/usage"):
+                return {
+                    "plan_type": "team",
+                    "rate_limit": {
+                        "allowed": True,
+                        "limit_reached": False,
+                        "primary_window": {
+                            "used_percent": 10,
+                            "limit_window_seconds": 18_000,
+                            "reset_at": 1_773_969_965,
+                        },
+                    },
+                }
+            raise AssertionError(f"unexpected request {url}")
+
+        for account, refresh_token in (
+            (saved_one, "refresh-token-user-1"),
+            (saved_two, "refresh-token-user-2"),
+        ):
+            snapshot_path = self.paths.accounts_dir / account.snapshot_name
+            payload, _ = read_json_file(snapshot_path)
+            payload["tokens"]["refresh_token"] = refresh_token
+            payload["tokens"]["access_token"] = build_access_token(
+                "team-account",
+                account.email,
+                "team",
+                user_id=account.user_id,
+            )
+            snapshot_path.write_text(json.dumps(payload), encoding="utf-8")
+
+        with patch("gpt_switcher.core.token_needs_refresh", return_value=True):
+            with patch("gpt_switcher.core.json_request", side_effect=fake_json_request):
+                self.service.load_usage(fresh=True)
+
+        active_payload, _ = read_json_file(self.paths.auth_path)
+        self.assertEqual(extract_auth_metadata(active_payload).user_id, "user-1")
 
     def test_switch_replaces_active_auth_file(self) -> None:
         write_auth_file(self.paths.auth_path, "account-1", "one@example.com")
