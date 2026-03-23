@@ -654,43 +654,101 @@ def format_token_count(tokens: int | None) -> str:
 def format_window_label(window_minutes: int | None, fallback: str) -> str:
     if window_minutes is None:
         return fallback
-    if window_minutes % 10080 == 0 and window_minutes >= 10080:
-        weeks = window_minutes // 10080
-        return "1w" if weeks == 1 else f"{weeks}w"
-    if window_minutes % 1440 == 0 and window_minutes >= 1440:
-        days = window_minutes // 1440
-        return "1d" if days == 1 else f"{days}d"
-    if window_minutes % 60 == 0 and window_minutes >= 60:
-        hours = window_minutes // 60
-        return "1h" if hours == 1 else f"{hours}h"
-    return f"{window_minutes}m"
+
+    minutes_per_hour = 60
+    minutes_per_day = 24 * minutes_per_hour
+    minutes_per_week = 7 * minutes_per_day
+    minutes_per_month = 30 * minutes_per_day
+    rounding_bias_minutes = 3
+    adjusted_minutes = max(0, window_minutes)
+
+    if adjusted_minutes <= minutes_per_day + rounding_bias_minutes:
+        hours = max(1, (adjusted_minutes + rounding_bias_minutes) // minutes_per_hour)
+        return f"{hours}h"
+    if adjusted_minutes <= minutes_per_week + rounding_bias_minutes:
+        return "weekly"
+    if adjusted_minutes <= minutes_per_month + rounding_bias_minutes:
+        return "monthly"
+    return "annual"
+
+
+def format_remaining_quota(used_percent: int | None) -> str:
+    if used_percent is None:
+        return "? left"
+    return f"{max(0, 100 - used_percent)}% left"
+
+
+def format_thread_count(thread_count: int | None) -> str:
+    if thread_count is None:
+        return "? threads"
+    if thread_count == 1:
+        return "1 thread"
+    return f"{thread_count} threads"
+
+
+def format_credit_balance(balance: str | None) -> str | None:
+    if balance is None:
+        return None
+
+    trimmed = balance.strip()
+    if not trimmed:
+        return None
+
+    try:
+        int_value = int(trimmed)
+    except ValueError:
+        try:
+            float_value = float(trimmed)
+        except ValueError:
+            return None
+        if float_value <= 0:
+            return None
+        return str(round(float_value))
+
+    if int_value <= 0:
+        return None
+    return str(int_value)
 
 
 def summarize_quota_snapshot(snapshot: UsageSnapshot) -> str:
-    primary_label = format_window_label(snapshot.primary_window_minutes, "primary")
-    secondary_label = format_window_label(snapshot.secondary_window_minutes, "secondary")
-    primary = f"{snapshot.primary_used_percent}%" if snapshot.primary_used_percent is not None else "?"
-    secondary = f"{snapshot.secondary_used_percent}%" if snapshot.secondary_used_percent is not None else "?"
-    reset_at = snapshot.primary_reset_at or snapshot.secondary_reset_at
-    reached_text = " reached" if snapshot.limit_reached else ""
-    return (
-        f"last-known quota{reached_text} {primary_label}:{primary} {secondary_label}:{secondary} "
-        f"reset:{format_timestamp(reset_at)} seen:{format_timestamp(snapshot.observed_at)}"
-    )
+    parts: list[str] = []
+
+    if snapshot.primary_used_percent is not None or snapshot.primary_window_minutes is not None:
+        parts.append(
+            f"{format_window_label(snapshot.primary_window_minutes, '5h')} "
+            f"{format_remaining_quota(snapshot.primary_used_percent)}"
+        )
+    if snapshot.secondary_used_percent is not None or snapshot.secondary_window_minutes is not None:
+        parts.append(
+            f"{format_window_label(snapshot.secondary_window_minutes, 'weekly')} "
+            f"{format_remaining_quota(snapshot.secondary_used_percent)}"
+        )
+
+    if snapshot.credits_unlimited:
+        parts.append("credits unlimited")
+    elif snapshot.credits_has_credits:
+        credit_balance = format_credit_balance(snapshot.credits_balance)
+        if credit_balance is not None:
+            parts.append(f"credits {credit_balance}")
+
+    if snapshot.limit_reached and not parts:
+        parts.append("limit reached")
+
+    return "; ".join(parts) if parts else "quota snapshot"
 
 
 def summarize_local_history_snapshot(snapshot: UsageSnapshot) -> str:
     token_text = format_token_count(snapshot.local_tokens_used)
-    thread_text = str(snapshot.local_thread_count) if snapshot.local_thread_count is not None else "?"
+    thread_text = format_thread_count(snapshot.local_thread_count)
     if snapshot.source == "active_auth_local_threads":
-        return f"local history since active auth {token_text} ({thread_text} threads, last {format_timestamp(snapshot.observed_at)})"
+        return f"local history since active auth {token_text} ({thread_text})"
 
     share_text = (
         f"{snapshot.local_share_percent:.1f}%"
         if snapshot.local_share_percent is not None
         else "?"
     )
-    return f"local history {token_text} ({share_text}, {thread_text} threads, last {format_timestamp(snapshot.observed_at)})"
+    return f"local history {token_text} ({share_text}, {thread_text})"
 
 
 def summarize_usage(usage: AccountUsage | None) -> str:

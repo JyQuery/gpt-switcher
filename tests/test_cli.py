@@ -408,6 +408,11 @@ class SwitcherCliTests(unittest.TestCase):
         self.assertEqual(snapshot.primary_used_percent, 21)
         self.assertEqual(snapshot.secondary_used_percent, 55)
 
+        summary = summarize_usage(load_usage_by_account(self.paths.logs_path)["account-otel"])
+        self.assertIn("5h 79% left", summary)
+        self.assertIn("weekly 45% left", summary)
+        self.assertIn("credits 12", summary)
+
     def test_list_shows_unknown_usage_when_no_logs_exist(self) -> None:
         write_auth_file(self.paths.auth_path, "account-1", "one@example.com")
         self.service.add_current_account("personal")
@@ -597,10 +602,9 @@ class SwitcherCliTests(unittest.TestCase):
 
         self.assertEqual(exit_code, 0)
         self.assertEqual(stderr, "")
-        self.assertIn("last-known quota", stdout)
-        self.assertIn("5h:5%", stdout)
-        self.assertIn("1w:30%", stdout)
-        self.assertIn("local history 4.2K", stdout)
+        self.assertIn("5h 95% left", stdout)
+        self.assertIn("weekly 70% left", stdout)
+        self.assertIn("local history 4.2K (100.0%, 1 thread)", stdout)
 
     def test_status_reports_quota_and_local_history_sources(self) -> None:
         write_auth_file(self.paths.auth_path, "account-1", "one@example.com")
