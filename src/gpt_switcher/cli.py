@@ -9,6 +9,7 @@ from .core import (
     SwitcherService,
     format_timestamp,
     render_table,
+    saved_account_key,
     short_account_id,
     summarize_usage,
 )
@@ -55,24 +56,29 @@ def command_list(service: SwitcherService, fresh: bool = False) -> int:
     if fresh:
         accounts = service.list_accounts()
     active = service.try_read_current_auth()
+    active_saved_account = service.find_saved_account(active)
     active_auth_observed_at = service.active_auth_observed_at()
-    if active is not None:
-        active_usage = service.augment_usage_with_active_history(active, usage_by_account.get(active.account_id))
+    if active is not None and active_saved_account is not None:
+        active_usage = service.augment_usage_with_active_history(
+            active,
+            usage_by_account.get(saved_account_key(active_saved_account)),
+        )
         if active_usage is not None:
             usage_by_account = dict(usage_by_account)
-            usage_by_account[active.account_id] = active_usage
+            usage_by_account[saved_account_key(active_saved_account)] = active_usage
 
     rows: list[list[str]] = []
     for account in accounts:
-        active_marker = "*" if active is not None and active.account_id == account.account_id else ""
-        usage = usage_by_account.get(account.account_id)
-        email = active.email if active is not None and active.account_id == account.account_id else account.email
+        is_active_account = active_saved_account is not None and active_saved_account.label == account.label
+        active_marker = "*" if is_active_account else ""
+        usage = usage_by_account.get(saved_account_key(account))
+        email = active.email if active is not None and is_active_account else account.email
         plan = account.plan_type
         if usage is not None and usage.quota_snapshot is not None and usage.quota_snapshot.plan_type:
             plan = usage.quota_snapshot.plan_type
         if (
             active is not None
-            and active.account_id == account.account_id
+            and is_active_account
             and active.plan_type != "unknown"
             and (
                 usage is None

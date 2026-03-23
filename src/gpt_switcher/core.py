@@ -87,6 +87,7 @@ class AuthMetadata:
 class SavedAccount:
     label: str
     account_id: str
+    user_id: str | None
     email: str
     plan_type: str
     snapshot_name: str
@@ -140,9 +141,88 @@ def label_key(label: str) -> str:
     return normalize_label(label).casefold()
 
 
+def saved_account_key(saved_account: SavedAccount) -> str:
+    return label_key(saved_account.label)
+
+
 def safe_label_fragment(label: str) -> str:
     fragment = SAFE_LABEL_PATTERN.sub("-", normalize_label(label)).strip(".-")
     return fragment or "account"
+
+
+def normalize_optional_str(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    normalized = value.strip()
+    return normalized or None
+
+
+def account_identity_equals(
+    account_id: str,
+    user_id: str | None,
+    other_account_id: str,
+    other_user_id: str | None,
+) -> bool:
+    if account_id != other_account_id:
+        return False
+    if user_id is None or other_user_id is None:
+        return user_id is None and other_user_id is None
+    return user_id == other_user_id
+
+
+def saved_account_matches_metadata(saved_account: SavedAccount, metadata: AuthMetadata) -> bool:
+    return account_identity_equals(
+        saved_account.account_id,
+        saved_account.user_id,
+        metadata.account_id,
+        metadata.user_id,
+    )
+
+
+def account_identity_conflicts(
+    account_id: str,
+    user_id: str | None,
+    other_account_id: str,
+    other_user_id: str | None,
+) -> bool:
+    if account_id != other_account_id:
+        return False
+    if user_id is None or other_user_id is None:
+        return True
+    return user_id == other_user_id
+
+
+def saved_account_conflicts_metadata(saved_account: SavedAccount, metadata: AuthMetadata) -> bool:
+    return account_identity_conflicts(
+        saved_account.account_id,
+        saved_account.user_id,
+        metadata.account_id,
+        metadata.user_id,
+    )
+
+
+def auth_metadata_matches(left: AuthMetadata, right: AuthMetadata) -> bool:
+    return account_identity_conflicts(
+        left.account_id,
+        left.user_id,
+        right.account_id,
+        right.user_id,
+    )
+
+
+def find_saved_account_for_metadata(
+    accounts: list[SavedAccount],
+    metadata: AuthMetadata,
+) -> SavedAccount | None:
+    if metadata.user_id is not None:
+        for account in accounts:
+            if account.account_id == metadata.account_id and account.user_id == metadata.user_id:
+                return account
+
+    matches = [account for account in accounts if account.account_id == metadata.account_id]
+    if len(matches) == 1:
+        return matches[0]
+    return None
 
 
 def now_utc_iso() -> str:
@@ -494,8 +574,8 @@ def fetch_live_quota_snapshot(codex_home: Path, auth_payload: dict[str, Any]) ->
         raise SwitcherError("Live ChatGPT quota response did not contain a usable rate limit snapshot.")
 
     refreshed_metadata = extract_auth_metadata(current_payload)
-    if refreshed_metadata.account_id != metadata.account_id:
-        raise SwitcherError("Refreshed auth resolved to a different account id.")
+    if not auth_metadata_matches(refreshed_metadata, metadata):
+        raise SwitcherError("Refreshed auth resolved to a different account identity.")
     return snapshot, current_payload
 
 
@@ -1127,13 +1207,16 @@ class SwitcherService:
         normalized_key = label_key(label)
 
         existing_label = registry.get(normalized_key)
-        if existing_label and existing_label.account_id != metadata.account_id:
+        if existing_label and not saved_account_matches_metadata(existing_label, metadata):
             raise SwitcherError(
                 f"Label '{label}' already exists for a different account ({existing_label.email}, {existing_label.account_id})."
             )
 
         for existing_account in registry.values():
-            if existing_account.account_id == metadata.account_id and label_key(existing_account.label) != normalized_key:
+            if (
+                label_key(existing_account.label) != normalized_key
+                and saved_account_conflicts_metadata(existing_account, metadata)
+            ):
                 raise SwitcherError(
                     f"Account {metadata.account_id} is already saved as '{existing_account.label}'."
                 )
@@ -1151,6 +1234,7 @@ class SwitcherService:
         saved_account = SavedAccount(
             label=label,
             account_id=metadata.account_id,
+            user_id=metadata.user_id,
             email=metadata.email,
             plan_type=metadata.plan_type,
             snapshot_name=snapshot_name,
@@ -1200,6 +1284,11 @@ class SwitcherService:
         auth_payload, _ = read_json_file(self.paths.auth_path)
         return extract_auth_metadata(auth_payload)
 
+    def find_saved_account(self, metadata: AuthMetadata | None) -> SavedAccount | None:
+        if metadata is None:
+            return None
+        return find_saved_account_for_metadata(list(self._load_registry().values()), metadata)
+
     def active_auth_observed_at(self) -> int | None:
         if not self.paths.auth_path.exists():
             return None
@@ -1235,11 +1324,7 @@ class SwitcherService:
 
         auth_payload, _ = read_json_file(self.paths.auth_path)
         metadata = extract_auth_metadata(auth_payload)
-        saved_account = None
-        for account in self._load_registry().values():
-            if account.account_id == metadata.account_id:
-                saved_account = account
-                break
+        saved_account = self.find_saved_account(metadata)
 
         usage = load_usage_by_account(self.paths.logs_path, self.paths.state_path).get(metadata.account_id)
         quota_refresh_error = None
@@ -1269,30 +1354,34 @@ class SwitcherService:
         fresh: bool = False,
         accounts: list[SavedAccount] | None = None,
     ) -> dict[str, AccountUsage]:
-        usage = load_usage_by_account(self.paths.logs_path, self.paths.state_path)
+        target_accounts = accounts if accounts is not None else self.list_accounts()
+        account_usage = load_usage_by_account(self.paths.logs_path, self.paths.state_path)
+        usage = {
+            saved_account_key(account): account_usage.get(account.account_id)
+            for account in target_accounts
+        }
         if not fresh:
             return usage
 
         active = self.try_read_current_auth()
-        active_account_id = active.account_id if active is not None else None
-        target_accounts = accounts if accounts is not None else self.list_accounts()
 
         for account in target_accounts:
-            existing = usage.get(account.account_id)
+            usage_key = saved_account_key(account)
+            existing = usage.get(usage_key)
             snapshot_path = self.paths.accounts_dir / account.snapshot_name
             try:
                 auth_payload, _ = read_json_file(snapshot_path)
                 live_snapshot, refreshed_payload = fetch_live_quota_snapshot(self.paths.codex_home, auth_payload)
-                self._persist_saved_account_payload(account, refreshed_payload, active_account_id)
+                self._persist_saved_account_payload(account, refreshed_payload, active)
                 if existing is None:
-                    usage[account.account_id] = AccountUsage(quota_snapshot=live_snapshot)
+                    usage[usage_key] = AccountUsage(quota_snapshot=live_snapshot)
                 else:
-                    usage[account.account_id] = replace(existing, quota_snapshot=live_snapshot, quota_refresh_error=None)
+                    usage[usage_key] = replace(existing, quota_snapshot=live_snapshot, quota_refresh_error=None)
             except SwitcherError as exc:
                 if existing is None:
-                    usage[account.account_id] = AccountUsage(quota_refresh_error=str(exc))
+                    usage[usage_key] = AccountUsage(quota_refresh_error=str(exc))
                 else:
-                    usage[account.account_id] = replace(existing, quota_refresh_error=str(exc))
+                    usage[usage_key] = replace(existing, quota_refresh_error=str(exc))
 
         return usage
 
@@ -1300,16 +1389,17 @@ class SwitcherService:
         self,
         saved_account: SavedAccount,
         auth_payload: dict[str, Any],
-        active_account_id: str | None,
+        active_metadata: AuthMetadata | None,
     ) -> SavedAccount:
         metadata = extract_auth_metadata(auth_payload)
         snapshot_path = self.paths.accounts_dir / saved_account.snapshot_name
         write_json_atomic(snapshot_path, auth_payload)
-        if active_account_id == saved_account.account_id:
+        if active_metadata is not None and saved_account_matches_metadata(saved_account, active_metadata):
             write_json_atomic(self.paths.auth_path, auth_payload)
 
         updated_saved_account = replace(
             saved_account,
+            user_id=metadata.user_id,
             email=metadata.email,
             plan_type=metadata.plan_type,
             token_expires_at=metadata.token_expires_at,
@@ -1334,6 +1424,7 @@ class SwitcherService:
 
         updated_saved_account = replace(
             saved_account,
+            user_id=metadata.user_id,
             email=metadata.email,
             plan_type=metadata.plan_type,
             token_expires_at=metadata.token_expires_at,
@@ -1342,6 +1433,25 @@ class SwitcherService:
         registry[label_key(saved_account.label)] = updated_saved_account
         self._save_registry(registry)
         return updated_saved_account
+
+    def _restore_saved_account_identity(self, saved_account: SavedAccount) -> SavedAccount:
+        if saved_account.user_id is not None:
+            return saved_account
+
+        snapshot_path = self.paths.accounts_dir / saved_account.snapshot_name
+        if not snapshot_path.exists():
+            return saved_account
+
+        try:
+            snapshot_payload, _ = read_json_file(snapshot_path)
+            metadata = extract_auth_metadata(snapshot_payload)
+        except SwitcherError:
+            return saved_account
+
+        if metadata.account_id != saved_account.account_id:
+            return saved_account
+
+        return replace(saved_account, user_id=metadata.user_id)
 
     def _load_registry(self) -> dict[str, SavedAccount]:
         if not self.paths.registry_path.exists():
@@ -1357,7 +1467,7 @@ class SwitcherService:
             raise SwitcherError(f"{self.paths.registry_path} must contain an 'accounts' list.")
 
         registry: dict[str, SavedAccount] = {}
-        seen_account_ids: set[str] = set()
+        seen_accounts: list[SavedAccount] = []
         for entry in account_entries:
             if not isinstance(entry, dict):
                 raise SwitcherError(f"{self.paths.registry_path} contains an invalid account entry.")
@@ -1365,23 +1475,33 @@ class SwitcherService:
             saved_account = SavedAccount(
                 label=normalize_label(str(entry.get("label", ""))),
                 account_id=str(entry.get("account_id", "")).strip(),
+                user_id=normalize_optional_str(entry.get("user_id")),
                 email=str(entry.get("email", "")).strip() or "unknown",
                 plan_type=str(entry.get("plan_type", "")).strip() or "unknown",
                 snapshot_name=str(entry.get("snapshot_name", "")).strip(),
                 saved_at=str(entry.get("saved_at", "")).strip(),
                 token_expires_at=parse_int(entry.get("token_expires_at")),
             )
+            saved_account = self._restore_saved_account_identity(saved_account)
             if not saved_account.account_id or not saved_account.snapshot_name:
                 raise SwitcherError(f"{self.paths.registry_path} contains an incomplete account entry.")
 
             key = label_key(saved_account.label)
             if key in registry:
                 raise SwitcherError(f"{self.paths.registry_path} contains duplicate labels.")
-            if saved_account.account_id in seen_account_ids:
+            if any(
+                account_identity_conflicts(
+                    saved_account.account_id,
+                    saved_account.user_id,
+                    seen_account.account_id,
+                    seen_account.user_id,
+                )
+                for seen_account in seen_accounts
+            ):
                 raise SwitcherError(f"{self.paths.registry_path} contains duplicate account ids.")
 
             registry[key] = saved_account
-            seen_account_ids.add(saved_account.account_id)
+            seen_accounts.append(saved_account)
 
         return registry
 
