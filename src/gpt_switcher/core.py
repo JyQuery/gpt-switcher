@@ -118,13 +118,6 @@ class UsageSnapshot:
 class AccountUsage:
     quota_snapshot: UsageSnapshot | None = None
     local_history_snapshot: UsageSnapshot | None = None
-
-
-@dataclass(frozen=True)
-class ActiveStatus:
-    metadata: AuthMetadata | None
-    saved_account: SavedAccount | None
-    usage: AccountUsage | None
     quota_refresh_error: str | None = None
 
 
@@ -919,12 +912,6 @@ def load_usage_by_account(logs_path: Path, state_path: Path | None = None) -> di
     return usage
 
 
-def format_timestamp(timestamp: int | None) -> str:
-    if timestamp is None:
-        return "unknown"
-    return datetime.fromtimestamp(timestamp, tz=UTC).astimezone().strftime("%Y-%m-%d %H:%M")
-
-
 def format_token_count(tokens: int | None) -> str:
     if tokens is None:
         return "?"
@@ -1184,59 +1171,50 @@ class SwitcherService:
             return AccountUsage(local_history_snapshot=fallback_snapshot)
         return replace(usage, local_history_snapshot=fallback_snapshot)
 
-    def get_active_status(self, refresh_quota: bool = False) -> ActiveStatus:
-        if not self.paths.auth_path.exists():
-            return ActiveStatus(metadata=None, saved_account=None, usage=None)
-
-        auth_payload, _ = read_json_file(self.paths.auth_path)
-        metadata = extract_auth_metadata(auth_payload)
-        saved_account = None
-        for account in self._load_registry().values():
-            if account.account_id == metadata.account_id:
-                saved_account = account
-                break
-
-        usage = self.load_usage().get(metadata.account_id)
-        quota_refresh_error = None
-        if refresh_quota:
-            try:
-                live_snapshot, refreshed_payload = fetch_live_quota_snapshot(self.paths.codex_home, auth_payload)
-                saved_account = self._persist_active_auth_payload(refreshed_payload, saved_account)
-                metadata = extract_auth_metadata(refreshed_payload)
-                if usage is None:
-                    usage = AccountUsage(quota_snapshot=live_snapshot)
-                else:
-                    usage = replace(usage, quota_snapshot=live_snapshot)
-            except SwitcherError as exc:
-                quota_refresh_error = str(exc)
-
-        usage = self.augment_usage_with_active_history(metadata, usage)
-        return ActiveStatus(
-            metadata=metadata,
-            saved_account=saved_account,
-            usage=usage,
-            quota_refresh_error=quota_refresh_error,
-        )
-
-    def load_usage(self) -> dict[str, AccountUsage]:
-        return load_usage_by_account(self.paths.logs_path, self.paths.state_path)
-
-    def get_active_status_with_refresh(self) -> ActiveStatus:
-        return self.get_active_status(refresh_quota=True)
-
-    def _persist_active_auth_payload(
+    def load_usage(
         self,
+        *,
+        fresh: bool = False,
+        accounts: list[SavedAccount] | None = None,
+    ) -> dict[str, AccountUsage]:
+        usage = load_usage_by_account(self.paths.logs_path, self.paths.state_path)
+        if not fresh:
+            return usage
+
+        active = self.try_read_current_auth()
+        active_account_id = active.account_id if active is not None else None
+        target_accounts = accounts if accounts is not None else self.list_accounts()
+
+        for account in target_accounts:
+            existing = usage.get(account.account_id)
+            snapshot_path = self.paths.accounts_dir / account.snapshot_name
+            try:
+                auth_payload, _ = read_json_file(snapshot_path)
+                live_snapshot, refreshed_payload = fetch_live_quota_snapshot(self.paths.codex_home, auth_payload)
+                self._persist_saved_account_payload(account, refreshed_payload, active_account_id)
+                if existing is None:
+                    usage[account.account_id] = AccountUsage(quota_snapshot=live_snapshot)
+                else:
+                    usage[account.account_id] = replace(existing, quota_snapshot=live_snapshot, quota_refresh_error=None)
+            except SwitcherError as exc:
+                if existing is None:
+                    usage[account.account_id] = AccountUsage(quota_refresh_error=str(exc))
+                else:
+                    usage[account.account_id] = replace(existing, quota_refresh_error=str(exc))
+
+        return usage
+
+    def _persist_saved_account_payload(
+        self,
+        saved_account: SavedAccount,
         auth_payload: dict[str, Any],
-        saved_account: SavedAccount | None,
-    ) -> SavedAccount | None:
-        write_json_atomic(self.paths.auth_path, auth_payload)
+        active_account_id: str | None,
+    ) -> SavedAccount:
         metadata = extract_auth_metadata(auth_payload)
-
-        if saved_account is None:
-            return None
-
         snapshot_path = self.paths.accounts_dir / saved_account.snapshot_name
         write_json_atomic(snapshot_path, auth_payload)
+        if active_account_id == saved_account.account_id:
+            write_json_atomic(self.paths.auth_path, auth_payload)
 
         updated_saved_account = replace(
             saved_account,
