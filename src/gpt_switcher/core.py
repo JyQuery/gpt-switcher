@@ -6,6 +6,10 @@ import os
 import re
 import sqlite3
 import tempfile
+import time
+import tomllib
+import urllib.error
+import urllib.request
 from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -16,6 +20,12 @@ REGISTRY_VERSION = 1
 REQUEST_MESSAGE_PREFIX = 'Request: "GET /backend-api/codex/responses HTTP/1.1'
 WS_EVENT_PREFIX = "websocket event: "
 RECEIVED_MESSAGE_PREFIX = "Received message "
+DEFAULT_CHATGPT_BASE_URL = "https://chatgpt.com/backend-api"
+REFRESH_TOKEN_URL = "https://auth.openai.com/oauth/token"
+REFRESH_TOKEN_URL_OVERRIDE_ENV_VAR = "CODEX_REFRESH_TOKEN_URL_OVERRIDE"
+REFRESH_TOKEN_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
+HTTP_TIMEOUT_SECONDS = 15
+USER_AGENT = "gpt-switcher"
 
 ACCOUNT_ID_PATTERN = re.compile(r"chatgpt-account-id:\s*(.+?)(?:\\r\\n|[\r\n]|$)")
 OTEL_ACCOUNT_ID_PATTERN = re.compile(r'user\.account_id="([^"]+)"')
@@ -23,6 +33,10 @@ SAFE_LABEL_PATTERN = re.compile(r"[^A-Za-z0-9._-]+")
 
 
 class SwitcherError(RuntimeError):
+    pass
+
+
+class LiveQuotaUnauthorizedError(RuntimeError):
     pass
 
 
@@ -111,6 +125,7 @@ class ActiveStatus:
     metadata: AuthMetadata | None
     saved_account: SavedAccount | None
     usage: AccountUsage | None
+    quota_refresh_error: str | None = None
 
 
 def normalize_label(label: str) -> str:
@@ -249,6 +264,259 @@ def parse_bool(value: Any) -> bool | None:
         if lowered == "false":
             return False
     return None
+
+
+def normalize_chatgpt_base_url(base_url: str) -> str:
+    normalized = base_url.strip()
+    while normalized.endswith("/"):
+        normalized = normalized[:-1]
+    if not normalized:
+        return DEFAULT_CHATGPT_BASE_URL
+    if (
+        (normalized.startswith("https://chatgpt.com") or normalized.startswith("https://chat.openai.com"))
+        and "/backend-api" not in normalized
+    ):
+        normalized = f"{normalized}/backend-api"
+    return normalized
+
+
+def load_chatgpt_base_url(codex_home: Path) -> str:
+    config_path = codex_home / "config.toml"
+    if not config_path.exists():
+        return DEFAULT_CHATGPT_BASE_URL
+
+    try:
+        payload = tomllib.loads(config_path.read_text(encoding="utf-8"))
+    except (OSError, tomllib.TOMLDecodeError) as exc:
+        raise SwitcherError(f"Failed to read Codex config at {config_path}: {exc}.") from exc
+
+    base_url = payload.get("chatgpt_base_url")
+    if isinstance(base_url, str) and base_url.strip():
+        return normalize_chatgpt_base_url(base_url)
+    return DEFAULT_CHATGPT_BASE_URL
+
+
+def json_request(
+    url: str,
+    *,
+    headers: dict[str, str] | None = None,
+    payload: dict[str, Any] | None = None,
+    timeout_seconds: int = HTTP_TIMEOUT_SECONDS,
+) -> dict[str, Any]:
+    request_headers = {"User-Agent": USER_AGENT}
+    if headers is not None:
+        request_headers.update(headers)
+
+    data = None
+    method = "GET"
+    if payload is not None:
+        request_headers.setdefault("Content-Type", "application/json")
+        data = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+        method = "POST"
+
+    request = urllib.request.Request(url, headers=request_headers, data=data, method=method)
+    try:
+        with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
+            body = response.read()
+    except urllib.error.HTTPError as exc:
+        response_body = exc.read().decode("utf-8", errors="replace")
+        if exc.code == 401:
+            raise LiveQuotaUnauthorizedError(response_body or f"HTTP 401 from {url}.") from exc
+        detail = response_body or getattr(exc, "reason", "") or f"HTTP {exc.code}"
+        raise SwitcherError(f"{method} {url} failed: {detail}.") from exc
+    except urllib.error.URLError as exc:
+        raise SwitcherError(f"{method} {url} failed: {exc.reason}.") from exc
+    except OSError as exc:
+        raise SwitcherError(f"{method} {url} failed: {exc}.") from exc
+
+    if not body:
+        return {}
+
+    try:
+        payload_value = json.loads(body.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise SwitcherError(f"{method} {url} returned invalid JSON.") from exc
+
+    if not isinstance(payload_value, dict):
+        raise SwitcherError(f"{method} {url} returned a non-object JSON payload.")
+    return payload_value
+
+
+def mapping_get(mapping: dict[str, Any], *keys: str) -> Any:
+    for key in keys:
+        if key in mapping:
+            return mapping.get(key)
+    return None
+
+
+def parse_window_minutes(window: dict[str, Any]) -> int | None:
+    window_minutes = parse_int(mapping_get(window, "window_minutes", "windowMinutes", "window_duration_mins", "windowDurationMins"))
+    if window_minutes is not None:
+        return window_minutes
+    limit_window_seconds = parse_int(mapping_get(window, "limit_window_seconds", "limitWindowSeconds"))
+    if limit_window_seconds is None:
+        return None
+    return limit_window_seconds // 60
+
+
+def parse_live_rate_limit_window(window: Any) -> tuple[int | None, int | None, int | None]:
+    if not isinstance(window, dict):
+        return None, None, None
+
+    return (
+        parse_int(mapping_get(window, "used_percent", "usedPercent")),
+        parse_window_minutes(window),
+        parse_int(mapping_get(window, "reset_at", "resetAt", "resets_at", "resetsAt")),
+    )
+
+
+def usage_snapshot_from_live_payload(observed_at: int, payload: dict[str, Any]) -> UsageSnapshot | None:
+    rate_limit = mapping_get(payload, "rate_limit", "rateLimit")
+    if not isinstance(rate_limit, dict):
+        return None
+
+    primary_used_percent, primary_window_minutes, primary_reset_at = parse_live_rate_limit_window(
+        mapping_get(rate_limit, "primary_window", "primaryWindow")
+    )
+    secondary_used_percent, secondary_window_minutes, secondary_reset_at = parse_live_rate_limit_window(
+        mapping_get(rate_limit, "secondary_window", "secondaryWindow")
+    )
+
+    credits = payload.get("credits")
+    if not isinstance(credits, dict):
+        credits = {}
+
+    plan_type = mapping_get(payload, "plan_type", "planType")
+    if not isinstance(plan_type, str):
+        plan_type = None
+
+    return UsageSnapshot(
+        observed_at=observed_at,
+        source="live_rate_limits",
+        plan_type=plan_type,
+        limit_reached=bool(mapping_get(rate_limit, "limit_reached", "limitReached")),
+        primary_used_percent=primary_used_percent,
+        secondary_used_percent=secondary_used_percent,
+        primary_window_minutes=primary_window_minutes,
+        secondary_window_minutes=secondary_window_minutes,
+        primary_reset_at=primary_reset_at,
+        secondary_reset_at=secondary_reset_at,
+        credits_has_credits=parse_bool(mapping_get(credits, "has_credits", "hasCredits")),
+        credits_balance=str(credits.get("balance")) if credits.get("balance") is not None else None,
+        credits_unlimited=parse_bool(credits.get("unlimited")),
+    )
+
+
+def token_needs_refresh(expires_at: int | None) -> bool:
+    if expires_at is None:
+        return False
+    return expires_at <= int(time.time()) + 60
+
+
+def refreshed_auth_payload(auth_payload: dict[str, Any]) -> dict[str, Any]:
+    tokens = auth_payload.get("tokens")
+    if not isinstance(tokens, dict):
+        raise SwitcherError("Codex auth.json does not contain OAuth tokens.")
+
+    refresh_token = tokens.get("refresh_token")
+    if not isinstance(refresh_token, str) or not refresh_token.strip():
+        raise SwitcherError("Codex auth.json does not contain a ChatGPT refresh token.")
+
+    refresh_url = os.environ.get(REFRESH_TOKEN_URL_OVERRIDE_ENV_VAR, REFRESH_TOKEN_URL)
+    try:
+        refresh_response = json_request(
+            refresh_url,
+            payload={
+                "client_id": REFRESH_TOKEN_CLIENT_ID,
+                "grant_type": "refresh_token",
+                "refresh_token": refresh_token,
+            },
+        )
+    except LiveQuotaUnauthorizedError as exc:
+        detail = str(exc).strip() or "unauthorized"
+        raise SwitcherError(f"Refresh token request was rejected: {detail}.") from exc
+
+    access_token = refresh_response.get("access_token")
+    if not isinstance(access_token, str) or not access_token.strip():
+        raise SwitcherError("Refresh token request did not return an access token.")
+
+    updated_tokens = dict(tokens)
+    updated_tokens["access_token"] = access_token
+    refreshed_token = refresh_response.get("refresh_token")
+    if isinstance(refreshed_token, str) and refreshed_token.strip():
+        updated_tokens["refresh_token"] = refreshed_token
+    refreshed_id_token = refresh_response.get("id_token")
+    if isinstance(refreshed_id_token, str) and refreshed_id_token.strip():
+        updated_tokens["id_token"] = refreshed_id_token
+
+    updated_payload = dict(auth_payload)
+    updated_payload["tokens"] = updated_tokens
+    updated_payload["last_refresh"] = now_utc_iso()
+    return updated_payload
+
+
+def fetch_live_quota_snapshot(codex_home: Path, auth_payload: dict[str, Any]) -> tuple[UsageSnapshot, dict[str, Any]]:
+    metadata = extract_auth_metadata(auth_payload)
+    if metadata.auth_mode is not None and metadata.auth_mode.casefold() != "chatgpt":
+        raise SwitcherError("Active auth is not using ChatGPT OAuth.")
+
+    base_url = load_chatgpt_base_url(codex_home)
+    usage_url = f"{base_url}/wham/usage" if "/backend-api" in base_url else f"{base_url}/api/codex/usage"
+    current_payload = auth_payload
+    current_metadata = metadata
+
+    if token_needs_refresh(metadata.token_expires_at):
+        current_payload = refreshed_auth_payload(current_payload)
+        current_metadata = extract_auth_metadata(current_payload)
+
+    request_headers = {
+        "Authorization": f"Bearer {current_payload['tokens']['access_token']}",
+        "ChatGPT-Account-Id": current_metadata.account_id,
+    }
+    try:
+        live_payload = json_request(usage_url, headers=request_headers)
+    except LiveQuotaUnauthorizedError:
+        current_payload = refreshed_auth_payload(current_payload)
+        current_metadata = extract_auth_metadata(current_payload)
+        request_headers = {
+            "Authorization": f"Bearer {current_payload['tokens']['access_token']}",
+            "ChatGPT-Account-Id": current_metadata.account_id,
+        }
+        try:
+            live_payload = json_request(usage_url, headers=request_headers)
+        except LiveQuotaUnauthorizedError as exc:
+            detail = str(exc).strip() or "unauthorized"
+            raise SwitcherError(f"Live ChatGPT quota fetch remained unauthorized after refresh: {detail}.") from exc
+
+    snapshot = usage_snapshot_from_live_payload(int(time.time()), live_payload)
+    if snapshot is None:
+        raise SwitcherError("Live ChatGPT quota response did not contain a usable rate limit snapshot.")
+
+    refreshed_metadata = extract_auth_metadata(current_payload)
+    if refreshed_metadata.account_id != metadata.account_id:
+        raise SwitcherError("Refreshed auth resolved to a different account id.")
+    return snapshot, current_payload
+
+
+def write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp_handle = tempfile.NamedTemporaryFile(
+        mode="wb",
+        delete=False,
+        dir=path.parent,
+        prefix=f"{path.stem}-",
+        suffix=".tmp",
+    )
+    temp_path = Path(temp_handle.name)
+    try:
+        with temp_handle:
+            temp_handle.write(json.dumps(payload, separators=(",", ":"), ensure_ascii=True).encode("utf-8"))
+        os.replace(temp_path, path)
+    except OSError as exc:
+        raise SwitcherError(f"Failed to write {path}: {exc}.") from exc
+    finally:
+        if temp_path.exists():
+            temp_path.unlink(missing_ok=True)
 
 
 def detect_log_body_column(connection: sqlite3.Connection) -> str:
@@ -916,25 +1184,70 @@ class SwitcherService:
             return AccountUsage(local_history_snapshot=fallback_snapshot)
         return replace(usage, local_history_snapshot=fallback_snapshot)
 
-    def get_active_status(self) -> ActiveStatus:
-        metadata = self.try_read_current_auth()
-        if metadata is None:
+    def get_active_status(self, refresh_quota: bool = False) -> ActiveStatus:
+        if not self.paths.auth_path.exists():
             return ActiveStatus(metadata=None, saved_account=None, usage=None)
 
+        auth_payload, _ = read_json_file(self.paths.auth_path)
+        metadata = extract_auth_metadata(auth_payload)
         saved_account = None
         for account in self._load_registry().values():
             if account.account_id == metadata.account_id:
                 saved_account = account
                 break
 
-        usage = self.augment_usage_with_active_history(
-            metadata,
-            self.load_usage().get(metadata.account_id),
+        usage = self.load_usage().get(metadata.account_id)
+        quota_refresh_error = None
+        if refresh_quota:
+            try:
+                live_snapshot, refreshed_payload = fetch_live_quota_snapshot(self.paths.codex_home, auth_payload)
+                saved_account = self._persist_active_auth_payload(refreshed_payload, saved_account)
+                metadata = extract_auth_metadata(refreshed_payload)
+                if usage is None:
+                    usage = AccountUsage(quota_snapshot=live_snapshot)
+                else:
+                    usage = replace(usage, quota_snapshot=live_snapshot)
+            except SwitcherError as exc:
+                quota_refresh_error = str(exc)
+
+        usage = self.augment_usage_with_active_history(metadata, usage)
+        return ActiveStatus(
+            metadata=metadata,
+            saved_account=saved_account,
+            usage=usage,
+            quota_refresh_error=quota_refresh_error,
         )
-        return ActiveStatus(metadata=metadata, saved_account=saved_account, usage=usage)
 
     def load_usage(self) -> dict[str, AccountUsage]:
         return load_usage_by_account(self.paths.logs_path, self.paths.state_path)
+
+    def get_active_status_with_refresh(self) -> ActiveStatus:
+        return self.get_active_status(refresh_quota=True)
+
+    def _persist_active_auth_payload(
+        self,
+        auth_payload: dict[str, Any],
+        saved_account: SavedAccount | None,
+    ) -> SavedAccount | None:
+        write_json_atomic(self.paths.auth_path, auth_payload)
+        metadata = extract_auth_metadata(auth_payload)
+
+        if saved_account is None:
+            return None
+
+        snapshot_path = self.paths.accounts_dir / saved_account.snapshot_name
+        write_json_atomic(snapshot_path, auth_payload)
+
+        updated_saved_account = replace(
+            saved_account,
+            email=metadata.email,
+            plan_type=metadata.plan_type,
+            token_expires_at=metadata.token_expires_at,
+        )
+        registry = self._load_registry()
+        registry[label_key(saved_account.label)] = updated_saved_account
+        self._save_registry(registry)
+        return updated_saved_account
 
     def _load_registry(self) -> dict[str, SavedAccount]:
         if not self.paths.registry_path.exists():
