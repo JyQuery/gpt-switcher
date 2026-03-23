@@ -182,6 +182,10 @@ def websocket_event(payload: dict) -> str:
     return "websocket event: " + json.dumps(payload, separators=(",", ":"))
 
 
+def received_message(payload: dict) -> str:
+    return "Received message " + json.dumps(payload, separators=(",", ":"))
+
+
 class SwitcherCliTests(unittest.TestCase):
     def setUp(self) -> None:
         self.tempdir = tempfile.TemporaryDirectory()
@@ -365,6 +369,91 @@ class SwitcherCliTests(unittest.TestCase):
         self.assertEqual(snapshot.secondary_used_percent, 27)
         self.assertEqual(snapshot.primary_reset_at, 1773969962)
         self.assertEqual(snapshot.credits_balance, "0")
+
+    def test_usage_parser_prefers_newer_usage_limit_log_message(self) -> None:
+        create_logs_db(self.paths.logs_path)
+        insert_log(
+            self.paths.logs_path,
+            ts=200,
+            target="log",
+            message=request_message("account-2"),
+            thread_id="thread-2",
+            process_uuid="proc-2",
+        )
+        insert_log(
+            self.paths.logs_path,
+            ts=201,
+            target="codex_api::endpoint::responses_websocket",
+            message=websocket_event(
+                {
+                    "type": "codex.rate_limits",
+                    "plan_type": "plus",
+                    "rate_limits": {
+                        "primary": {
+                            "used_percent": 2,
+                            "window_minutes": 300,
+                            "reset_at": 1773969965,
+                        },
+                        "secondary": {
+                            "used_percent": 54,
+                            "window_minutes": 10080,
+                            "reset_at": 1774471692,
+                        },
+                    },
+                }
+            ),
+            thread_id="thread-2",
+            process_uuid="proc-2",
+        )
+        insert_log(
+            self.paths.logs_path,
+            ts=300,
+            target="log",
+            message=request_message("account-2"),
+            thread_id="thread-3",
+            process_uuid="proc-3",
+        )
+        insert_log(
+            self.paths.logs_path,
+            ts=301,
+            target="log",
+            message=received_message(
+                {
+                    "type": "error",
+                    "error": {
+                        "type": "usage_limit_reached",
+                        "message": "The usage limit has been reached",
+                        "plan_type": "plus",
+                        "resets_at": 1774471692,
+                    },
+                    "status_code": 429,
+                    "headers": {
+                        "X-Codex-Plan-Type": "plus",
+                        "X-Codex-Primary-Used-Percent": "68",
+                        "X-Codex-Secondary-Used-Percent": "100",
+                        "X-Codex-Primary-Window-Minutes": "300",
+                        "X-Codex-Secondary-Window-Minutes": "10080",
+                        "X-Codex-Primary-Reset-At": "1774270091",
+                        "X-Codex-Secondary-Reset-At": "1774471692",
+                        "X-Codex-Credits-Has-Credits": "False",
+                        "X-Codex-Credits-Balance": "0",
+                        "X-Codex-Credits-Unlimited": "False",
+                    },
+                }
+            ),
+            thread_id="",
+            process_uuid="proc-3",
+        )
+
+        usage = load_latest_usage_by_account(self.paths.logs_path)
+
+        snapshot = usage["account-2"]
+        self.assertTrue(snapshot.limit_reached)
+        self.assertEqual(snapshot.primary_used_percent, 68)
+        self.assertEqual(snapshot.secondary_used_percent, 100)
+        self.assertEqual(snapshot.secondary_reset_at, 1774471692)
+        summary = summarize_usage(load_usage_by_account(self.paths.logs_path)["account-2"])
+        self.assertIn("weekly 0% left", summary)
 
     def test_usage_parser_maps_rate_limits_from_otel_account_rows(self) -> None:
         create_logs_db(self.paths.logs_path)

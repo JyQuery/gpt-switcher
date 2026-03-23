@@ -15,6 +15,7 @@ from typing import Any
 REGISTRY_VERSION = 1
 REQUEST_MESSAGE_PREFIX = 'Request: "GET /backend-api/codex/responses HTTP/1.1'
 WS_EVENT_PREFIX = "websocket event: "
+RECEIVED_MESSAGE_PREFIX = "Received message "
 
 ACCOUNT_ID_PATTERN = re.compile(r"chatgpt-account-id:\s*(.+?)(?:\\r\\n|[\r\n]|$)")
 OTEL_ACCOUNT_ID_PATTERN = re.compile(r'user\.account_id="([^"]+)"')
@@ -419,6 +420,18 @@ def usage_snapshot_from_payload(observed_at: int, payload: dict[str, Any]) -> Us
     return None
 
 
+def parse_usage_payload(message: str) -> dict[str, Any] | None:
+    for prefix in (WS_EVENT_PREFIX, RECEIVED_MESSAGE_PREFIX):
+        if not message.startswith(prefix):
+            continue
+        try:
+            payload = json.loads(message[len(prefix):])
+        except json.JSONDecodeError:
+            return None
+        return payload if isinstance(payload, dict) else None
+    return None
+
+
 def load_latest_usage_by_account(logs_path: Path) -> dict[str, UsageSnapshot]:
     if not logs_path.exists():
         return {}
@@ -434,11 +447,19 @@ def load_latest_usage_by_account(logs_path: Path) -> dict[str, UsageSnapshot]:
             f"""
             SELECT id, ts, thread_id, process_uuid, {body_column} AS body
             FROM logs
-            WHERE target = 'codex_api::endpoint::responses_websocket'
-              AND (
-                {body_column} LIKE 'websocket event: {{"type":"codex.rate_limits"%'
-                OR {body_column} LIKE 'websocket event: {{"type":"error","error":{{"type":"usage_limit_reached"%'
-              )
+            WHERE (
+                target = 'codex_api::endpoint::responses_websocket'
+                AND (
+                    {body_column} LIKE 'websocket event: {{"type":"codex.rate_limits"%'
+                    OR {body_column} LIKE 'websocket event: {{"type":"error","error":{{"type":"usage_limit_reached"%'
+                )
+            ) OR (
+                target = 'log'
+                AND (
+                    {body_column} LIKE 'Received message {{"type":"codex.rate_limits"%'
+                    OR {body_column} LIKE 'Received message {{"type":"error","error":{{"type":"usage_limit_reached"%'
+                )
+            )
             ORDER BY id DESC
             """
         ).fetchall()
@@ -446,7 +467,7 @@ def load_latest_usage_by_account(logs_path: Path) -> dict[str, UsageSnapshot]:
         latest_by_account: dict[str, UsageSnapshot] = {}
         for row in event_rows:
             message = row["body"]
-            if not isinstance(message, str) or not message.startswith(WS_EVENT_PREFIX):
+            if not isinstance(message, str):
                 continue
 
             account_id = resolve_account_id(
@@ -459,9 +480,8 @@ def load_latest_usage_by_account(logs_path: Path) -> dict[str, UsageSnapshot]:
             if not account_id or account_id in latest_by_account:
                 continue
 
-            try:
-                payload = json.loads(message[len(WS_EVENT_PREFIX):])
-            except json.JSONDecodeError:
+            payload = parse_usage_payload(message)
+            if payload is None:
                 continue
 
             snapshot = usage_snapshot_from_payload(int(row["ts"]), payload)
