@@ -1139,6 +1139,87 @@ class SwitcherCliTests(unittest.TestCase):
         assert requests[0][1] is not None
         self.assertEqual(requests[0][1]["ChatGPT-Account-Id"], "account-1")
 
+    def test_list_fresh_keeps_distinct_live_usage_for_team_members(self) -> None:
+        contact_token = build_access_token("team-account", "contact@img.pink", "team", user_id="user-contact")
+        other_token = build_access_token("team-account", "other@example.com", "team", user_id="user-other")
+
+        write_auth_file(
+            self.paths.auth_path,
+            "team-account",
+            "contact@img.pink",
+            plan_type="team",
+            user_id="user-contact",
+        )
+        self.service.add_current_account("img")
+
+        write_auth_file(
+            self.paths.auth_path,
+            "team-account",
+            "other@example.com",
+            plan_type="team",
+            user_id="user-other",
+        )
+        self.service.add_current_account("other")
+
+        def fake_json_request(
+            url: str,
+            *,
+            headers: dict[str, str] | None = None,
+            payload: dict | None = None,
+            timeout_seconds: int = 15,
+        ) -> dict:
+            del payload, timeout_seconds
+            assert headers is not None
+            if url.endswith("/wham/usage") and headers["Authorization"] == f"Bearer {contact_token}":
+                return {
+                    "plan_type": "team",
+                    "rate_limit": {
+                        "allowed": False,
+                        "limit_reached": True,
+                        "primary_window": {
+                            "used_percent": 100,
+                            "limit_window_seconds": 18_000,
+                            "reset_at": 1_773_969_965,
+                        },
+                        "secondary_window": {
+                            "used_percent": 100,
+                            "limit_window_seconds": 604_800,
+                            "reset_at": 1_774_569_999,
+                        },
+                    },
+                }
+            if url.endswith("/wham/usage") and headers["Authorization"] == f"Bearer {other_token}":
+                return {
+                    "plan_type": "team",
+                    "rate_limit": {
+                        "allowed": True,
+                        "limit_reached": False,
+                        "primary_window": {
+                            "used_percent": 20,
+                            "limit_window_seconds": 18_000,
+                            "reset_at": 1_773_969_965,
+                        },
+                        "secondary_window": {
+                            "used_percent": 10,
+                            "limit_window_seconds": 604_800,
+                            "reset_at": 1_774_569_999,
+                        },
+                    },
+                }
+            raise AssertionError(f"unexpected request {url} {headers}")
+
+        with patch("gpt_switcher.core.json_request", side_effect=fake_json_request):
+            exit_code, stdout, stderr = self.run_cli("list", "--fresh")
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(stderr, "")
+        contact_line = next(line for line in stdout.splitlines() if "contact@img.pink" in line)
+        other_line = next(line for line in stdout.splitlines() if "other@example.com" in line)
+        self.assertIn("5h 0% left", contact_line)
+        self.assertIn("weekly 0% left", contact_line)
+        self.assertIn("5h 80% left", other_line)
+        self.assertIn("weekly 90% left", other_line)
+
     def test_list_fresh_retries_after_unauthorized_for_inactive_account_and_updates_snapshot(self) -> None:
         write_auth_file(self.paths.auth_path, "account-1", "one@example.com")
         saved = self.service.add_current_account("personal")

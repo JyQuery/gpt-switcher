@@ -141,6 +141,10 @@ def label_key(label: str) -> str:
     return normalize_label(label).casefold()
 
 
+def saved_account_key(saved_account: SavedAccount) -> str:
+    return label_key(saved_account.label)
+
+
 def safe_label_fragment(label: str) -> str:
     fragment = SAFE_LABEL_PATTERN.sub("-", normalize_label(label)).strip(".-")
     return fragment or "account"
@@ -1350,29 +1354,34 @@ class SwitcherService:
         fresh: bool = False,
         accounts: list[SavedAccount] | None = None,
     ) -> dict[str, AccountUsage]:
-        usage = load_usage_by_account(self.paths.logs_path, self.paths.state_path)
+        target_accounts = accounts if accounts is not None else self.list_accounts()
+        account_usage = load_usage_by_account(self.paths.logs_path, self.paths.state_path)
+        usage = {
+            saved_account_key(account): account_usage.get(account.account_id)
+            for account in target_accounts
+        }
         if not fresh:
             return usage
 
         active = self.try_read_current_auth()
-        target_accounts = accounts if accounts is not None else self.list_accounts()
 
         for account in target_accounts:
-            existing = usage.get(account.account_id)
+            usage_key = saved_account_key(account)
+            existing = usage.get(usage_key)
             snapshot_path = self.paths.accounts_dir / account.snapshot_name
             try:
                 auth_payload, _ = read_json_file(snapshot_path)
                 live_snapshot, refreshed_payload = fetch_live_quota_snapshot(self.paths.codex_home, auth_payload)
                 self._persist_saved_account_payload(account, refreshed_payload, active)
                 if existing is None:
-                    usage[account.account_id] = AccountUsage(quota_snapshot=live_snapshot)
+                    usage[usage_key] = AccountUsage(quota_snapshot=live_snapshot)
                 else:
-                    usage[account.account_id] = replace(existing, quota_snapshot=live_snapshot, quota_refresh_error=None)
+                    usage[usage_key] = replace(existing, quota_snapshot=live_snapshot, quota_refresh_error=None)
             except SwitcherError as exc:
                 if existing is None:
-                    usage[account.account_id] = AccountUsage(quota_refresh_error=str(exc))
+                    usage[usage_key] = AccountUsage(quota_refresh_error=str(exc))
                 else:
-                    usage[account.account_id] = replace(existing, quota_refresh_error=str(exc))
+                    usage[usage_key] = replace(existing, quota_refresh_error=str(exc))
 
         return usage
 
