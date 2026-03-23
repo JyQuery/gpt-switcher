@@ -6,6 +6,10 @@ import os
 import re
 import sqlite3
 import tempfile
+import time
+import tomllib
+import urllib.error
+import urllib.request
 from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -15,6 +19,13 @@ from typing import Any
 REGISTRY_VERSION = 1
 REQUEST_MESSAGE_PREFIX = 'Request: "GET /backend-api/codex/responses HTTP/1.1'
 WS_EVENT_PREFIX = "websocket event: "
+RECEIVED_MESSAGE_PREFIX = "Received message "
+DEFAULT_CHATGPT_BASE_URL = "https://chatgpt.com/backend-api"
+REFRESH_TOKEN_URL = "https://auth.openai.com/oauth/token"
+REFRESH_TOKEN_URL_OVERRIDE_ENV_VAR = "CODEX_REFRESH_TOKEN_URL_OVERRIDE"
+REFRESH_TOKEN_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
+HTTP_TIMEOUT_SECONDS = 15
+USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36"
 
 ACCOUNT_ID_PATTERN = re.compile(r"chatgpt-account-id:\s*(.+?)(?:\\r\\n|[\r\n]|$)")
 OTEL_ACCOUNT_ID_PATTERN = re.compile(r'user\.account_id="([^"]+)"')
@@ -22,6 +33,10 @@ SAFE_LABEL_PATTERN = re.compile(r"[^A-Za-z0-9._-]+")
 
 
 class SwitcherError(RuntimeError):
+    pass
+
+
+class LiveQuotaUnauthorizedError(RuntimeError):
     pass
 
 
@@ -103,13 +118,7 @@ class UsageSnapshot:
 class AccountUsage:
     quota_snapshot: UsageSnapshot | None = None
     local_history_snapshot: UsageSnapshot | None = None
-
-
-@dataclass(frozen=True)
-class ActiveStatus:
-    metadata: AuthMetadata | None
-    saved_account: SavedAccount | None
-    usage: AccountUsage | None
+    quota_refresh_error: str | None = None
 
 
 def normalize_label(label: str) -> str:
@@ -248,6 +257,259 @@ def parse_bool(value: Any) -> bool | None:
         if lowered == "false":
             return False
     return None
+
+
+def normalize_chatgpt_base_url(base_url: str) -> str:
+    normalized = base_url.strip()
+    while normalized.endswith("/"):
+        normalized = normalized[:-1]
+    if not normalized:
+        return DEFAULT_CHATGPT_BASE_URL
+    if (
+        (normalized.startswith("https://chatgpt.com") or normalized.startswith("https://chat.openai.com"))
+        and "/backend-api" not in normalized
+    ):
+        normalized = f"{normalized}/backend-api"
+    return normalized
+
+
+def load_chatgpt_base_url(codex_home: Path) -> str:
+    config_path = codex_home / "config.toml"
+    if not config_path.exists():
+        return DEFAULT_CHATGPT_BASE_URL
+
+    try:
+        payload = tomllib.loads(config_path.read_text(encoding="utf-8"))
+    except (OSError, tomllib.TOMLDecodeError) as exc:
+        raise SwitcherError(f"Failed to read Codex config at {config_path}: {exc}.") from exc
+
+    base_url = payload.get("chatgpt_base_url")
+    if isinstance(base_url, str) and base_url.strip():
+        return normalize_chatgpt_base_url(base_url)
+    return DEFAULT_CHATGPT_BASE_URL
+
+
+def json_request(
+    url: str,
+    *,
+    headers: dict[str, str] | None = None,
+    payload: dict[str, Any] | None = None,
+    timeout_seconds: int = HTTP_TIMEOUT_SECONDS,
+) -> dict[str, Any]:
+    request_headers = {"User-Agent": USER_AGENT}
+    if headers is not None:
+        request_headers.update(headers)
+
+    data = None
+    method = "GET"
+    if payload is not None:
+        request_headers.setdefault("Content-Type", "application/json")
+        data = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+        method = "POST"
+
+    request = urllib.request.Request(url, headers=request_headers, data=data, method=method)
+    try:
+        with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
+            body = response.read()
+    except urllib.error.HTTPError as exc:
+        response_body = exc.read().decode("utf-8", errors="replace")
+        if exc.code == 401:
+            raise LiveQuotaUnauthorizedError(response_body or f"HTTP 401 from {url}.") from exc
+        detail = response_body or getattr(exc, "reason", "") or f"HTTP {exc.code}"
+        raise SwitcherError(f"{method} {url} failed: {detail}.") from exc
+    except urllib.error.URLError as exc:
+        raise SwitcherError(f"{method} {url} failed: {exc.reason}.") from exc
+    except OSError as exc:
+        raise SwitcherError(f"{method} {url} failed: {exc}.") from exc
+
+    if not body:
+        return {}
+
+    try:
+        payload_value = json.loads(body.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise SwitcherError(f"{method} {url} returned invalid JSON.") from exc
+
+    if not isinstance(payload_value, dict):
+        raise SwitcherError(f"{method} {url} returned a non-object JSON payload.")
+    return payload_value
+
+
+def mapping_get(mapping: dict[str, Any], *keys: str) -> Any:
+    for key in keys:
+        if key in mapping:
+            return mapping.get(key)
+    return None
+
+
+def parse_window_minutes(window: dict[str, Any]) -> int | None:
+    window_minutes = parse_int(mapping_get(window, "window_minutes", "windowMinutes", "window_duration_mins", "windowDurationMins"))
+    if window_minutes is not None:
+        return window_minutes
+    limit_window_seconds = parse_int(mapping_get(window, "limit_window_seconds", "limitWindowSeconds"))
+    if limit_window_seconds is None:
+        return None
+    return limit_window_seconds // 60
+
+
+def parse_live_rate_limit_window(window: Any) -> tuple[int | None, int | None, int | None]:
+    if not isinstance(window, dict):
+        return None, None, None
+
+    return (
+        parse_int(mapping_get(window, "used_percent", "usedPercent")),
+        parse_window_minutes(window),
+        parse_int(mapping_get(window, "reset_at", "resetAt", "resets_at", "resetsAt")),
+    )
+
+
+def usage_snapshot_from_live_payload(observed_at: int, payload: dict[str, Any]) -> UsageSnapshot | None:
+    rate_limit = mapping_get(payload, "rate_limit", "rateLimit")
+    if not isinstance(rate_limit, dict):
+        return None
+
+    primary_used_percent, primary_window_minutes, primary_reset_at = parse_live_rate_limit_window(
+        mapping_get(rate_limit, "primary_window", "primaryWindow")
+    )
+    secondary_used_percent, secondary_window_minutes, secondary_reset_at = parse_live_rate_limit_window(
+        mapping_get(rate_limit, "secondary_window", "secondaryWindow")
+    )
+
+    credits = payload.get("credits")
+    if not isinstance(credits, dict):
+        credits = {}
+
+    plan_type = mapping_get(payload, "plan_type", "planType")
+    if not isinstance(plan_type, str):
+        plan_type = None
+
+    return UsageSnapshot(
+        observed_at=observed_at,
+        source="live_rate_limits",
+        plan_type=plan_type,
+        limit_reached=bool(mapping_get(rate_limit, "limit_reached", "limitReached")),
+        primary_used_percent=primary_used_percent,
+        secondary_used_percent=secondary_used_percent,
+        primary_window_minutes=primary_window_minutes,
+        secondary_window_minutes=secondary_window_minutes,
+        primary_reset_at=primary_reset_at,
+        secondary_reset_at=secondary_reset_at,
+        credits_has_credits=parse_bool(mapping_get(credits, "has_credits", "hasCredits")),
+        credits_balance=str(credits.get("balance")) if credits.get("balance") is not None else None,
+        credits_unlimited=parse_bool(credits.get("unlimited")),
+    )
+
+
+def token_needs_refresh(expires_at: int | None) -> bool:
+    if expires_at is None:
+        return False
+    return expires_at <= int(time.time()) + 60
+
+
+def refreshed_auth_payload(auth_payload: dict[str, Any]) -> dict[str, Any]:
+    tokens = auth_payload.get("tokens")
+    if not isinstance(tokens, dict):
+        raise SwitcherError("Codex auth.json does not contain OAuth tokens.")
+
+    refresh_token = tokens.get("refresh_token")
+    if not isinstance(refresh_token, str) or not refresh_token.strip():
+        raise SwitcherError("Codex auth.json does not contain a ChatGPT refresh token.")
+
+    refresh_url = os.environ.get(REFRESH_TOKEN_URL_OVERRIDE_ENV_VAR, REFRESH_TOKEN_URL)
+    try:
+        refresh_response = json_request(
+            refresh_url,
+            payload={
+                "client_id": REFRESH_TOKEN_CLIENT_ID,
+                "grant_type": "refresh_token",
+                "refresh_token": refresh_token,
+            },
+        )
+    except LiveQuotaUnauthorizedError as exc:
+        detail = str(exc).strip() or "unauthorized"
+        raise SwitcherError(f"Refresh token request was rejected: {detail}.") from exc
+
+    access_token = refresh_response.get("access_token")
+    if not isinstance(access_token, str) or not access_token.strip():
+        raise SwitcherError("Refresh token request did not return an access token.")
+
+    updated_tokens = dict(tokens)
+    updated_tokens["access_token"] = access_token
+    refreshed_token = refresh_response.get("refresh_token")
+    if isinstance(refreshed_token, str) and refreshed_token.strip():
+        updated_tokens["refresh_token"] = refreshed_token
+    refreshed_id_token = refresh_response.get("id_token")
+    if isinstance(refreshed_id_token, str) and refreshed_id_token.strip():
+        updated_tokens["id_token"] = refreshed_id_token
+
+    updated_payload = dict(auth_payload)
+    updated_payload["tokens"] = updated_tokens
+    updated_payload["last_refresh"] = now_utc_iso()
+    return updated_payload
+
+
+def fetch_live_quota_snapshot(codex_home: Path, auth_payload: dict[str, Any]) -> tuple[UsageSnapshot, dict[str, Any]]:
+    metadata = extract_auth_metadata(auth_payload)
+    if metadata.auth_mode is not None and metadata.auth_mode.casefold() != "chatgpt":
+        raise SwitcherError("Active auth is not using ChatGPT OAuth.")
+
+    base_url = load_chatgpt_base_url(codex_home)
+    usage_url = f"{base_url}/wham/usage" if "/backend-api" in base_url else f"{base_url}/api/codex/usage"
+    current_payload = auth_payload
+    current_metadata = metadata
+
+    if token_needs_refresh(metadata.token_expires_at):
+        current_payload = refreshed_auth_payload(current_payload)
+        current_metadata = extract_auth_metadata(current_payload)
+
+    request_headers = {
+        "Authorization": f"Bearer {current_payload['tokens']['access_token']}",
+        "ChatGPT-Account-Id": current_metadata.account_id,
+    }
+    try:
+        live_payload = json_request(usage_url, headers=request_headers)
+    except LiveQuotaUnauthorizedError:
+        current_payload = refreshed_auth_payload(current_payload)
+        current_metadata = extract_auth_metadata(current_payload)
+        request_headers = {
+            "Authorization": f"Bearer {current_payload['tokens']['access_token']}",
+            "ChatGPT-Account-Id": current_metadata.account_id,
+        }
+        try:
+            live_payload = json_request(usage_url, headers=request_headers)
+        except LiveQuotaUnauthorizedError as exc:
+            detail = str(exc).strip() or "unauthorized"
+            raise SwitcherError(f"Live ChatGPT quota fetch remained unauthorized after refresh: {detail}.") from exc
+
+    snapshot = usage_snapshot_from_live_payload(int(time.time()), live_payload)
+    if snapshot is None:
+        raise SwitcherError("Live ChatGPT quota response did not contain a usable rate limit snapshot.")
+
+    refreshed_metadata = extract_auth_metadata(current_payload)
+    if refreshed_metadata.account_id != metadata.account_id:
+        raise SwitcherError("Refreshed auth resolved to a different account id.")
+    return snapshot, current_payload
+
+
+def write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp_handle = tempfile.NamedTemporaryFile(
+        mode="wb",
+        delete=False,
+        dir=path.parent,
+        prefix=f"{path.stem}-",
+        suffix=".tmp",
+    )
+    temp_path = Path(temp_handle.name)
+    try:
+        with temp_handle:
+            temp_handle.write(json.dumps(payload, separators=(",", ":"), ensure_ascii=True).encode("utf-8"))
+        os.replace(temp_path, path)
+    except OSError as exc:
+        raise SwitcherError(f"Failed to write {path}: {exc}.") from exc
+    finally:
+        if temp_path.exists():
+            temp_path.unlink(missing_ok=True)
 
 
 def detect_log_body_column(connection: sqlite3.Connection) -> str:
@@ -419,6 +681,18 @@ def usage_snapshot_from_payload(observed_at: int, payload: dict[str, Any]) -> Us
     return None
 
 
+def parse_usage_payload(message: str) -> dict[str, Any] | None:
+    for prefix in (WS_EVENT_PREFIX, RECEIVED_MESSAGE_PREFIX):
+        if not message.startswith(prefix):
+            continue
+        try:
+            payload = json.loads(message[len(prefix):])
+        except json.JSONDecodeError:
+            return None
+        return payload if isinstance(payload, dict) else None
+    return None
+
+
 def load_latest_usage_by_account(logs_path: Path) -> dict[str, UsageSnapshot]:
     if not logs_path.exists():
         return {}
@@ -434,11 +708,19 @@ def load_latest_usage_by_account(logs_path: Path) -> dict[str, UsageSnapshot]:
             f"""
             SELECT id, ts, thread_id, process_uuid, {body_column} AS body
             FROM logs
-            WHERE target = 'codex_api::endpoint::responses_websocket'
-              AND (
-                {body_column} LIKE 'websocket event: {{"type":"codex.rate_limits"%'
-                OR {body_column} LIKE 'websocket event: {{"type":"error","error":{{"type":"usage_limit_reached"%'
-              )
+            WHERE (
+                target = 'codex_api::endpoint::responses_websocket'
+                AND (
+                    {body_column} LIKE 'websocket event: {{"type":"codex.rate_limits"%'
+                    OR {body_column} LIKE 'websocket event: {{"type":"error","error":{{"type":"usage_limit_reached"%'
+                )
+            ) OR (
+                target = 'log'
+                AND (
+                    {body_column} LIKE 'Received message {{"type":"codex.rate_limits"%'
+                    OR {body_column} LIKE 'Received message {{"type":"error","error":{{"type":"usage_limit_reached"%'
+                )
+            )
             ORDER BY id DESC
             """
         ).fetchall()
@@ -446,7 +728,7 @@ def load_latest_usage_by_account(logs_path: Path) -> dict[str, UsageSnapshot]:
         latest_by_account: dict[str, UsageSnapshot] = {}
         for row in event_rows:
             message = row["body"]
-            if not isinstance(message, str) or not message.startswith(WS_EVENT_PREFIX):
+            if not isinstance(message, str):
                 continue
 
             account_id = resolve_account_id(
@@ -459,9 +741,8 @@ def load_latest_usage_by_account(logs_path: Path) -> dict[str, UsageSnapshot]:
             if not account_id or account_id in latest_by_account:
                 continue
 
-            try:
-                payload = json.loads(message[len(WS_EVENT_PREFIX):])
-            except json.JSONDecodeError:
+            payload = parse_usage_payload(message)
+            if payload is None:
                 continue
 
             snapshot = usage_snapshot_from_payload(int(row["ts"]), payload)
@@ -631,12 +912,6 @@ def load_usage_by_account(logs_path: Path, state_path: Path | None = None) -> di
     return usage
 
 
-def format_timestamp(timestamp: int | None) -> str:
-    if timestamp is None:
-        return "unknown"
-    return datetime.fromtimestamp(timestamp, tz=UTC).astimezone().strftime("%Y-%m-%d %H:%M")
-
-
 def format_token_count(tokens: int | None) -> str:
     if tokens is None:
         return "?"
@@ -654,43 +929,101 @@ def format_token_count(tokens: int | None) -> str:
 def format_window_label(window_minutes: int | None, fallback: str) -> str:
     if window_minutes is None:
         return fallback
-    if window_minutes % 10080 == 0 and window_minutes >= 10080:
-        weeks = window_minutes // 10080
-        return "1w" if weeks == 1 else f"{weeks}w"
-    if window_minutes % 1440 == 0 and window_minutes >= 1440:
-        days = window_minutes // 1440
-        return "1d" if days == 1 else f"{days}d"
-    if window_minutes % 60 == 0 and window_minutes >= 60:
-        hours = window_minutes // 60
-        return "1h" if hours == 1 else f"{hours}h"
-    return f"{window_minutes}m"
+
+    minutes_per_hour = 60
+    minutes_per_day = 24 * minutes_per_hour
+    minutes_per_week = 7 * minutes_per_day
+    minutes_per_month = 30 * minutes_per_day
+    rounding_bias_minutes = 3
+    adjusted_minutes = max(0, window_minutes)
+
+    if adjusted_minutes <= minutes_per_day + rounding_bias_minutes:
+        hours = max(1, (adjusted_minutes + rounding_bias_minutes) // minutes_per_hour)
+        return f"{hours}h"
+    if adjusted_minutes <= minutes_per_week + rounding_bias_minutes:
+        return "weekly"
+    if adjusted_minutes <= minutes_per_month + rounding_bias_minutes:
+        return "monthly"
+    return "annual"
+
+
+def format_remaining_quota(used_percent: int | None) -> str:
+    if used_percent is None:
+        return "? left"
+    return f"{max(0, 100 - used_percent)}% left"
+
+
+def format_thread_count(thread_count: int | None) -> str:
+    if thread_count is None:
+        return "? threads"
+    if thread_count == 1:
+        return "1 thread"
+    return f"{thread_count} threads"
+
+
+def format_credit_balance(balance: str | None) -> str | None:
+    if balance is None:
+        return None
+
+    trimmed = balance.strip()
+    if not trimmed:
+        return None
+
+    try:
+        int_value = int(trimmed)
+    except ValueError:
+        try:
+            float_value = float(trimmed)
+        except ValueError:
+            return None
+        if float_value <= 0:
+            return None
+        return str(round(float_value))
+
+    if int_value <= 0:
+        return None
+    return str(int_value)
 
 
 def summarize_quota_snapshot(snapshot: UsageSnapshot) -> str:
-    primary_label = format_window_label(snapshot.primary_window_minutes, "primary")
-    secondary_label = format_window_label(snapshot.secondary_window_minutes, "secondary")
-    primary = f"{snapshot.primary_used_percent}%" if snapshot.primary_used_percent is not None else "?"
-    secondary = f"{snapshot.secondary_used_percent}%" if snapshot.secondary_used_percent is not None else "?"
-    reset_at = snapshot.primary_reset_at or snapshot.secondary_reset_at
-    reached_text = " reached" if snapshot.limit_reached else ""
-    return (
-        f"last-known quota{reached_text} {primary_label}:{primary} {secondary_label}:{secondary} "
-        f"reset:{format_timestamp(reset_at)} seen:{format_timestamp(snapshot.observed_at)}"
-    )
+    parts: list[str] = []
+
+    if snapshot.primary_used_percent is not None or snapshot.primary_window_minutes is not None:
+        parts.append(
+            f"{format_window_label(snapshot.primary_window_minutes, '5h')} "
+            f"{format_remaining_quota(snapshot.primary_used_percent)}"
+        )
+    if snapshot.secondary_used_percent is not None or snapshot.secondary_window_minutes is not None:
+        parts.append(
+            f"{format_window_label(snapshot.secondary_window_minutes, 'weekly')} "
+            f"{format_remaining_quota(snapshot.secondary_used_percent)}"
+        )
+
+    if snapshot.credits_unlimited:
+        parts.append("credits unlimited")
+    elif snapshot.credits_has_credits:
+        credit_balance = format_credit_balance(snapshot.credits_balance)
+        if credit_balance is not None:
+            parts.append(f"credits {credit_balance}")
+
+    if snapshot.limit_reached and not parts:
+        parts.append("limit reached")
+
+    return "; ".join(parts) if parts else "quota snapshot"
 
 
 def summarize_local_history_snapshot(snapshot: UsageSnapshot) -> str:
     token_text = format_token_count(snapshot.local_tokens_used)
-    thread_text = str(snapshot.local_thread_count) if snapshot.local_thread_count is not None else "?"
+    thread_text = format_thread_count(snapshot.local_thread_count)
     if snapshot.source == "active_auth_local_threads":
-        return f"local history since active auth {token_text} ({thread_text} threads, last {format_timestamp(snapshot.observed_at)})"
+        return f"local history since active auth {token_text} ({thread_text})"
 
     share_text = (
         f"{snapshot.local_share_percent:.1f}%"
         if snapshot.local_share_percent is not None
         else "?"
     )
-    return f"local history {token_text} ({share_text}, {thread_text} threads, last {format_timestamp(snapshot.observed_at)})"
+    return f"local history {token_text} ({share_text}, {thread_text})"
 
 
 def summarize_usage(usage: AccountUsage | None) -> str:
@@ -838,25 +1171,61 @@ class SwitcherService:
             return AccountUsage(local_history_snapshot=fallback_snapshot)
         return replace(usage, local_history_snapshot=fallback_snapshot)
 
-    def get_active_status(self) -> ActiveStatus:
-        metadata = self.try_read_current_auth()
-        if metadata is None:
-            return ActiveStatus(metadata=None, saved_account=None, usage=None)
+    def load_usage(
+        self,
+        *,
+        fresh: bool = False,
+        accounts: list[SavedAccount] | None = None,
+    ) -> dict[str, AccountUsage]:
+        usage = load_usage_by_account(self.paths.logs_path, self.paths.state_path)
+        if not fresh:
+            return usage
 
-        saved_account = None
-        for account in self._load_registry().values():
-            if account.account_id == metadata.account_id:
-                saved_account = account
-                break
+        active = self.try_read_current_auth()
+        active_account_id = active.account_id if active is not None else None
+        target_accounts = accounts if accounts is not None else self.list_accounts()
 
-        usage = self.augment_usage_with_active_history(
-            metadata,
-            self.load_usage().get(metadata.account_id),
+        for account in target_accounts:
+            existing = usage.get(account.account_id)
+            snapshot_path = self.paths.accounts_dir / account.snapshot_name
+            try:
+                auth_payload, _ = read_json_file(snapshot_path)
+                live_snapshot, refreshed_payload = fetch_live_quota_snapshot(self.paths.codex_home, auth_payload)
+                self._persist_saved_account_payload(account, refreshed_payload, active_account_id)
+                if existing is None:
+                    usage[account.account_id] = AccountUsage(quota_snapshot=live_snapshot)
+                else:
+                    usage[account.account_id] = replace(existing, quota_snapshot=live_snapshot, quota_refresh_error=None)
+            except SwitcherError as exc:
+                if existing is None:
+                    usage[account.account_id] = AccountUsage(quota_refresh_error=str(exc))
+                else:
+                    usage[account.account_id] = replace(existing, quota_refresh_error=str(exc))
+
+        return usage
+
+    def _persist_saved_account_payload(
+        self,
+        saved_account: SavedAccount,
+        auth_payload: dict[str, Any],
+        active_account_id: str | None,
+    ) -> SavedAccount:
+        metadata = extract_auth_metadata(auth_payload)
+        snapshot_path = self.paths.accounts_dir / saved_account.snapshot_name
+        write_json_atomic(snapshot_path, auth_payload)
+        if active_account_id == saved_account.account_id:
+            write_json_atomic(self.paths.auth_path, auth_payload)
+
+        updated_saved_account = replace(
+            saved_account,
+            email=metadata.email,
+            plan_type=metadata.plan_type,
+            token_expires_at=metadata.token_expires_at,
         )
-        return ActiveStatus(metadata=metadata, saved_account=saved_account, usage=usage)
-
-    def load_usage(self) -> dict[str, AccountUsage]:
-        return load_usage_by_account(self.paths.logs_path, self.paths.state_path)
+        registry = self._load_registry()
+        registry[label_key(saved_account.label)] = updated_saved_account
+        self._save_registry(registry)
+        return updated_saved_account
 
     def _load_registry(self) -> dict[str, SavedAccount]:
         if not self.paths.registry_path.exists():

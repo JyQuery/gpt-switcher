@@ -27,7 +27,7 @@ Examples:
 gpt-switcher add personal
 gpt-switcher add work
 gpt-switcher list
-gpt-switcher status
+gpt-switcher list --fresh # Get fresh daily/weekly limit for all accounts.
 gpt-switcher switch work
 ```
 

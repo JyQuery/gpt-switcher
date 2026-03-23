@@ -14,6 +14,7 @@ from unittest.mock import patch
 from gpt_switcher.cli import main
 from gpt_switcher.core import (
     AppPaths,
+    LiveQuotaUnauthorizedError,
     SwitcherError,
     SwitcherService,
     extract_auth_metadata,
@@ -182,6 +183,10 @@ def websocket_event(payload: dict) -> str:
     return "websocket event: " + json.dumps(payload, separators=(",", ":"))
 
 
+def received_message(payload: dict) -> str:
+    return "Received message " + json.dumps(payload, separators=(",", ":"))
+
+
 class SwitcherCliTests(unittest.TestCase):
     def setUp(self) -> None:
         self.tempdir = tempfile.TemporaryDirectory()
@@ -209,7 +214,10 @@ class SwitcherCliTests(unittest.TestCase):
             redirect_stdout(stdout),
             redirect_stderr(stderr),
         ):
-            exit_code = main(list(argv))
+            try:
+                exit_code = main(list(argv))
+            except SystemExit as exc:
+                exit_code = int(exc.code)
         return exit_code, stdout.getvalue(), stderr.getvalue()
 
     def test_add_saves_current_account_snapshot(self) -> None:
@@ -249,15 +257,12 @@ class SwitcherCliTests(unittest.TestCase):
         self.assertEqual(metadata.account_id, "account-1")
         self.assertEqual(metadata.email, "one@example.com")
 
-    def test_status_reports_unmanaged_current_account(self) -> None:
-        write_auth_file(self.paths.auth_path, "account-9", "unmanaged@example.com")
-
+    def test_status_command_is_not_available(self) -> None:
         exit_code, stdout, stderr = self.run_cli("status")
 
-        self.assertEqual(exit_code, 0)
-        self.assertEqual(stderr, "")
-        self.assertIn("Label: unmanaged", stdout)
-        self.assertIn("Email: unmanaged@example.com", stdout)
+        self.assertEqual(exit_code, 2)
+        self.assertEqual(stdout, "")
+        self.assertIn("invalid choice: 'status'", stderr)
 
     def test_list_prefers_current_auth_plan_for_active_account(self) -> None:
         write_auth_file(self.paths.auth_path, "account-1", "one@example.com", plan_type="free")
@@ -366,6 +371,91 @@ class SwitcherCliTests(unittest.TestCase):
         self.assertEqual(snapshot.primary_reset_at, 1773969962)
         self.assertEqual(snapshot.credits_balance, "0")
 
+    def test_usage_parser_prefers_newer_usage_limit_log_message(self) -> None:
+        create_logs_db(self.paths.logs_path)
+        insert_log(
+            self.paths.logs_path,
+            ts=200,
+            target="log",
+            message=request_message("account-2"),
+            thread_id="thread-2",
+            process_uuid="proc-2",
+        )
+        insert_log(
+            self.paths.logs_path,
+            ts=201,
+            target="codex_api::endpoint::responses_websocket",
+            message=websocket_event(
+                {
+                    "type": "codex.rate_limits",
+                    "plan_type": "plus",
+                    "rate_limits": {
+                        "primary": {
+                            "used_percent": 2,
+                            "window_minutes": 300,
+                            "reset_at": 1773969965,
+                        },
+                        "secondary": {
+                            "used_percent": 54,
+                            "window_minutes": 10080,
+                            "reset_at": 1774471692,
+                        },
+                    },
+                }
+            ),
+            thread_id="thread-2",
+            process_uuid="proc-2",
+        )
+        insert_log(
+            self.paths.logs_path,
+            ts=300,
+            target="log",
+            message=request_message("account-2"),
+            thread_id="thread-3",
+            process_uuid="proc-3",
+        )
+        insert_log(
+            self.paths.logs_path,
+            ts=301,
+            target="log",
+            message=received_message(
+                {
+                    "type": "error",
+                    "error": {
+                        "type": "usage_limit_reached",
+                        "message": "The usage limit has been reached",
+                        "plan_type": "plus",
+                        "resets_at": 1774471692,
+                    },
+                    "status_code": 429,
+                    "headers": {
+                        "X-Codex-Plan-Type": "plus",
+                        "X-Codex-Primary-Used-Percent": "68",
+                        "X-Codex-Secondary-Used-Percent": "100",
+                        "X-Codex-Primary-Window-Minutes": "300",
+                        "X-Codex-Secondary-Window-Minutes": "10080",
+                        "X-Codex-Primary-Reset-At": "1774270091",
+                        "X-Codex-Secondary-Reset-At": "1774471692",
+                        "X-Codex-Credits-Has-Credits": "False",
+                        "X-Codex-Credits-Balance": "0",
+                        "X-Codex-Credits-Unlimited": "False",
+                    },
+                }
+            ),
+            thread_id="",
+            process_uuid="proc-3",
+        )
+
+        usage = load_latest_usage_by_account(self.paths.logs_path)
+
+        snapshot = usage["account-2"]
+        self.assertTrue(snapshot.limit_reached)
+        self.assertEqual(snapshot.primary_used_percent, 68)
+        self.assertEqual(snapshot.secondary_used_percent, 100)
+        self.assertEqual(snapshot.secondary_reset_at, 1774471692)
+        summary = summarize_usage(load_usage_by_account(self.paths.logs_path)["account-2"])
+        self.assertIn("weekly 0% left", summary)
+
     def test_usage_parser_maps_rate_limits_from_otel_account_rows(self) -> None:
         create_logs_db(self.paths.logs_path)
         insert_log(
@@ -407,6 +497,11 @@ class SwitcherCliTests(unittest.TestCase):
         self.assertEqual(snapshot.source, "rate_limits")
         self.assertEqual(snapshot.primary_used_percent, 21)
         self.assertEqual(snapshot.secondary_used_percent, 55)
+
+        summary = summarize_usage(load_usage_by_account(self.paths.logs_path)["account-otel"])
+        self.assertIn("5h 79% left", summary)
+        self.assertIn("weekly 45% left", summary)
+        self.assertIn("credits 12", summary)
 
     def test_list_shows_unknown_usage_when_no_logs_exist(self) -> None:
         write_auth_file(self.paths.auth_path, "account-1", "one@example.com")
@@ -597,16 +692,136 @@ class SwitcherCliTests(unittest.TestCase):
 
         self.assertEqual(exit_code, 0)
         self.assertEqual(stderr, "")
-        self.assertIn("last-known quota", stdout)
-        self.assertIn("5h:5%", stdout)
-        self.assertIn("1w:30%", stdout)
-        self.assertIn("local history 4.2K", stdout)
+        self.assertIn("5h 95% left", stdout)
+        self.assertIn("weekly 70% left", stdout)
+        self.assertIn("local history 4.2K (100.0%, 1 thread)", stdout)
 
-    def test_status_reports_quota_and_local_history_sources(self) -> None:
+    def test_list_fresh_fetches_live_quota_for_saved_accounts(self) -> None:
+        write_auth_file(self.paths.auth_path, "account-1", "one@example.com", plan_type="free")
+        self.service.add_current_account("personal")
+
+        requests: list[tuple[str, dict[str, str] | None, dict | None]] = []
+
+        def fake_json_request(
+            url: str,
+            *,
+            headers: dict[str, str] | None = None,
+            payload: dict | None = None,
+            timeout_seconds: int = 15,
+        ) -> dict:
+            del timeout_seconds
+            requests.append((url, headers, payload))
+            return {
+                "plan_type": "plus",
+                "rate_limit": {
+                    "allowed": True,
+                    "limit_reached": False,
+                    "primary_window": {
+                        "used_percent": 8,
+                        "limit_window_seconds": 18_000,
+                        "reset_at": 1_773_969_965,
+                    },
+                    "secondary_window": {
+                        "used_percent": 87,
+                        "limit_window_seconds": 604_800,
+                        "reset_at": 1_774_569_999,
+                    },
+                },
+                "credits": {
+                    "has_credits": True,
+                    "unlimited": False,
+                    "balance": "12",
+                },
+            }
+
+        with patch("gpt_switcher.core.json_request", side_effect=fake_json_request):
+            exit_code, stdout, stderr = self.run_cli("list", "--fresh")
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(stderr, "")
+        self.assertIn("plus", stdout)
+        self.assertIn("5h 92% left; weekly 13% left; credits 12", stdout)
+        self.assertNotIn("fresh fetch failed", stdout)
+        self.assertEqual(requests[0][0], "https://chatgpt.com/backend-api/wham/usage")
+        assert requests[0][1] is not None
+        self.assertEqual(requests[0][1]["ChatGPT-Account-Id"], "account-1")
+
+    def test_list_fresh_retries_after_unauthorized_for_inactive_account_and_updates_snapshot(self) -> None:
+        write_auth_file(self.paths.auth_path, "account-1", "one@example.com")
+        saved = self.service.add_current_account("personal")
+        write_auth_file(self.paths.auth_path, "account-2", "two@example.com")
+        self.service.add_current_account("work")
+
+        refreshed_access_token = build_access_token("account-1", "one@example.com")
+        calls: list[tuple[str, dict[str, str] | None, dict | None]] = []
+
+        def fake_json_request(
+            url: str,
+            *,
+            headers: dict[str, str] | None = None,
+            payload: dict | None = None,
+            timeout_seconds: int = 15,
+        ) -> dict:
+            del timeout_seconds
+            calls.append((url, headers, payload))
+            if (
+                url.endswith("/wham/usage")
+                and headers is not None
+                and headers["ChatGPT-Account-Id"] == "account-1"
+                and len(
+                    [
+                        call
+                        for call in calls
+                        if call[0].endswith("/wham/usage")
+                        and call[1] is not None
+                        and call[1]["ChatGPT-Account-Id"] == "account-1"
+                    ]
+                )
+                == 1
+            ):
+                raise LiveQuotaUnauthorizedError("expired")
+            if url.endswith("/oauth/token"):
+                return {
+                    "access_token": refreshed_access_token,
+                    "refresh_token": "new-refresh-token",
+                }
+            if url.endswith("/wham/usage"):
+                assert headers is not None
+                if headers["ChatGPT-Account-Id"] == "account-1":
+                    self.assertEqual(headers["Authorization"], f"Bearer {refreshed_access_token}")
+                return {
+                    "plan_type": "plus",
+                    "rate_limit": {
+                        "allowed": True,
+                        "limit_reached": False,
+                        "primary_window": {
+                            "used_percent": 10,
+                            "limit_window_seconds": 18_000,
+                            "reset_at": 1_773_969_965,
+                        },
+                    },
+                }
+            raise AssertionError(f"unexpected request {url}")
+
+        with patch("gpt_switcher.core.json_request", side_effect=fake_json_request):
+            exit_code, stdout, stderr = self.run_cli("list", "--fresh")
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(stderr, "")
+        self.assertIn("personal", stdout)
+        self.assertIn("work", stdout)
+
+        auth_payload, _ = read_json_file(self.paths.auth_path)
+        self.assertEqual(extract_auth_metadata(auth_payload).account_id, "account-2")
+
+        snapshot_payload, _ = read_json_file(self.paths.accounts_dir / saved.snapshot_name)
+        self.assertEqual(snapshot_payload["tokens"]["access_token"], refreshed_access_token)
+        self.assertEqual(snapshot_payload["tokens"]["refresh_token"], "new-refresh-token")
+
+    def test_list_fresh_marks_fallback_when_live_fetch_fails(self) -> None:
         write_auth_file(self.paths.auth_path, "account-1", "one@example.com")
         self.service.add_current_account("personal")
         create_logs_db(self.paths.logs_path)
-        create_state_db(self.paths.state_path)
         insert_log(
             self.paths.logs_path,
             ts=100,
@@ -626,44 +841,25 @@ class SwitcherCliTests(unittest.TestCase):
                         "primary": {
                             "used_percent": 5,
                             "window_minutes": 300,
-                            "reset_at": 1773969965,
+                            "reset_at": 1_773_969_965,
                         },
                         "secondary": {
                             "used_percent": 30,
-                            "window_minutes": 10080,
-                            "reset_at": 1774569999,
+                            "window_minutes": 10_080,
+                            "reset_at": 1_774_569_999,
                         },
                     },
                 }
             ),
             thread_id="thread-1",
         )
-        insert_thread(self.paths.state_path, thread_id="thread-1", tokens_used=4200, updated_at=300)
 
-        exit_code, stdout, stderr = self.run_cli("status")
-
-        self.assertEqual(exit_code, 0)
-        self.assertEqual(stderr, "")
-        self.assertIn("Quota source: last known Codex websocket snapshot, not a live ChatGPT quota fetch.", stdout)
-        self.assertIn("Local history source: local Codex thread history.", stdout)
-        self.assertIn("Quota observed:", stdout)
-        self.assertIn("Local history observed:", stdout)
-
-    def test_status_reports_active_auth_local_history_source(self) -> None:
-        write_auth_file(self.paths.auth_path, "account-1", "one@example.com")
-        self.service.add_current_account("personal")
-        create_state_db(self.paths.state_path)
-        cutoff = 1_700_000_000
-        os.utime(self.paths.auth_path, (cutoff, cutoff))
-        insert_thread(self.paths.state_path, thread_id="thread-after", tokens_used=1200, updated_at=cutoff + 100)
-
-        exit_code, stdout, stderr = self.run_cli("status")
+        with patch("gpt_switcher.core.json_request", side_effect=SwitcherError("network down")):
+            exit_code, stdout, stderr = self.run_cli("list", "--fresh")
 
         self.assertEqual(exit_code, 0)
         self.assertEqual(stderr, "")
-        self.assertIn("local history since active auth 1.2K", stdout)
-        self.assertIn("Local history source: threads updated since the current auth.json became active.", stdout)
-        self.assertIn("Local history observed:", stdout)
+        self.assertIn("5h 95% left; weekly 70% left; fresh fetch failed", stdout)
 
     def test_local_usage_summary_shows_percentage_share(self) -> None:
         create_logs_db(self.paths.logs_path)
