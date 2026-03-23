@@ -985,18 +985,55 @@ def format_credit_balance(balance: str | None) -> str | None:
     return str(int_value)
 
 
-def summarize_quota_snapshot(snapshot: UsageSnapshot) -> str:
+def format_reset_datetime(reset_at: int | None) -> str | None:
+    if reset_at is None:
+        return None
+
+    try:
+        reset_datetime = datetime.fromtimestamp(reset_at, UTC)
+    except (OverflowError, OSError, ValueError):
+        return None
+
+    return reset_datetime.strftime("%Y-%m-%d %H:%M UTC")
+
+
+def summarize_quota_window(
+    label: str,
+    used_percent: int | None,
+    reset_at: int | None,
+    *,
+    include_reset_datetime: bool,
+) -> str:
+    summary = f"{label} {format_remaining_quota(used_percent)}"
+    if not include_reset_datetime:
+        return summary
+
+    reset_text = format_reset_datetime(reset_at)
+    if reset_text is None:
+        return summary
+    return f"{summary} (resets {reset_text})"
+
+
+def summarize_quota_snapshot(snapshot: UsageSnapshot, *, include_reset_datetime: bool = False) -> str:
     parts: list[str] = []
 
     if snapshot.primary_used_percent is not None or snapshot.primary_window_minutes is not None:
         parts.append(
-            f"{format_window_label(snapshot.primary_window_minutes, '5h')} "
-            f"{format_remaining_quota(snapshot.primary_used_percent)}"
+            summarize_quota_window(
+                format_window_label(snapshot.primary_window_minutes, "5h"),
+                snapshot.primary_used_percent,
+                snapshot.primary_reset_at,
+                include_reset_datetime=include_reset_datetime,
+            )
         )
     if snapshot.secondary_used_percent is not None or snapshot.secondary_window_minutes is not None:
         parts.append(
-            f"{format_window_label(snapshot.secondary_window_minutes, 'weekly')} "
-            f"{format_remaining_quota(snapshot.secondary_used_percent)}"
+            summarize_quota_window(
+                format_window_label(snapshot.secondary_window_minutes, "weekly"),
+                snapshot.secondary_used_percent,
+                snapshot.secondary_reset_at,
+                include_reset_datetime=include_reset_datetime,
+            )
         )
 
     if snapshot.credits_unlimited:
@@ -1026,13 +1063,20 @@ def summarize_local_history_snapshot(snapshot: UsageSnapshot) -> str:
     return f"local history {token_text} ({share_text}, {thread_text})"
 
 
-def summarize_usage(usage: AccountUsage | None) -> str:
+def summarize_usage(usage: AccountUsage | None, *, include_live_reset_datetime: bool = False) -> str:
     if usage is None:
         return "unknown"
 
     parts: list[str] = []
     if usage.quota_snapshot is not None:
-        parts.append(summarize_quota_snapshot(usage.quota_snapshot))
+        parts.append(
+            summarize_quota_snapshot(
+                usage.quota_snapshot,
+                include_reset_datetime=(
+                    include_live_reset_datetime and usage.quota_snapshot.source == "live_rate_limits"
+                ),
+            )
+        )
     if usage.local_history_snapshot is not None:
         parts.append(summarize_local_history_snapshot(usage.local_history_snapshot))
     return "; ".join(parts) if parts else "unknown"

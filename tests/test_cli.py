@@ -740,7 +740,11 @@ class SwitcherCliTests(unittest.TestCase):
         self.assertEqual(exit_code, 0)
         self.assertEqual(stderr, "")
         self.assertIn("plus", stdout)
-        self.assertIn("5h 92% left; weekly 13% left; credits 12", stdout)
+        self.assertIn(
+            "5h 92% left (resets 2026-03-20 01:26 UTC); "
+            "weekly 13% left (resets 2026-03-27 00:06 UTC); credits 12",
+            stdout,
+        )
         self.assertNotIn("fresh fetch failed", stdout)
         self.assertEqual(requests[0][0], "https://chatgpt.com/backend-api/wham/usage")
         assert requests[0][1] is not None

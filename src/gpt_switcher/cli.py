@@ -111,7 +111,7 @@ def command_switch(service: SwitcherService, label: str) -> int:
 
 
 def render_usage_text(usage, *, fresh: bool = False) -> str:
-    summary = summarize_usage(usage)
+    summary = summarize_usage(usage, include_live_reset_datetime=fresh)
     if fresh and usage is not None and usage.quota_refresh_error is not None:
         if summary == "unknown":
             return "fresh fetch failed"
