@@ -839,7 +839,11 @@ class SwitcherCliTests(unittest.TestCase):
         self.assertEqual(exit_code, 0)
         self.assertEqual(stderr, "")
         self.assertIn("Plan: plus", stdout)
-        self.assertIn("Usage: 5h 92% left; weekly 13% left; credits 12", stdout)
+        self.assertIn(
+            "Usage: 5h 92% left (resets 2026-03-20 01:26 UTC); "
+            "weekly 13% left (resets 2026-03-27 00:06 UTC); credits 12",
+            stdout,
+        )
         self.assertIn("Quota source: live ChatGPT rate limits fetch.", stdout)
         self.assertNotIn("last known Codex websocket snapshot", stdout)
         self.assertEqual(requests[0][0], "https://chatgpt.com/backend-api/wham/usage")

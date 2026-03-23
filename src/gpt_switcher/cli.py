@@ -134,7 +134,7 @@ def command_status(service: SwitcherService) -> int:
     print(f"Account ID: {status.metadata.account_id}")
     if status.metadata.token_expires_at is not None:
         print(f"Access token expires: {format_timestamp(status.metadata.token_expires_at)}")
-    print(f"Usage: {summarize_usage(status.usage)}")
+    print(f"Usage: {summarize_usage(status.usage, include_live_reset_datetime=True)}")
     if status.quota_refresh_error is not None:
         print(f"Quota refresh: live fetch failed; {status.quota_refresh_error}")
     if status.usage is not None:
