@@ -121,6 +121,14 @@ class AccountUsage:
     quota_refresh_error: str | None = None
 
 
+@dataclass(frozen=True)
+class ActiveStatus:
+    metadata: AuthMetadata | None
+    saved_account: SavedAccount | None
+    usage: AccountUsage | None
+    quota_refresh_error: str | None = None
+
+
 def normalize_label(label: str) -> str:
     normalized = label.strip()
     if not normalized:
@@ -947,6 +955,12 @@ def format_window_label(window_minutes: int | None, fallback: str) -> str:
     return "annual"
 
 
+def format_timestamp(timestamp: int | None) -> str:
+    if timestamp is None:
+        return "unknown"
+    return datetime.fromtimestamp(timestamp, tz=UTC).astimezone().strftime("%Y-%m-%d %H:%M")
+
+
 def format_remaining_quota(used_percent: int | None) -> str:
     if used_percent is None:
         return "? left"
@@ -985,18 +999,55 @@ def format_credit_balance(balance: str | None) -> str | None:
     return str(int_value)
 
 
-def summarize_quota_snapshot(snapshot: UsageSnapshot) -> str:
+def format_reset_datetime(reset_at: int | None) -> str | None:
+    if reset_at is None:
+        return None
+
+    try:
+        reset_datetime = datetime.fromtimestamp(reset_at, UTC)
+    except (OverflowError, OSError, ValueError):
+        return None
+
+    return reset_datetime.strftime("%Y-%m-%d %H:%M UTC")
+
+
+def summarize_quota_window(
+    label: str,
+    used_percent: int | None,
+    reset_at: int | None,
+    *,
+    include_reset_datetime: bool,
+) -> str:
+    summary = f"{label} {format_remaining_quota(used_percent)}"
+    if not include_reset_datetime:
+        return summary
+
+    reset_text = format_reset_datetime(reset_at)
+    if reset_text is None:
+        return summary
+    return f"{summary} (resets {reset_text})"
+
+
+def summarize_quota_snapshot(snapshot: UsageSnapshot, *, include_reset_datetime: bool = False) -> str:
     parts: list[str] = []
 
     if snapshot.primary_used_percent is not None or snapshot.primary_window_minutes is not None:
         parts.append(
-            f"{format_window_label(snapshot.primary_window_minutes, '5h')} "
-            f"{format_remaining_quota(snapshot.primary_used_percent)}"
+            summarize_quota_window(
+                format_window_label(snapshot.primary_window_minutes, "5h"),
+                snapshot.primary_used_percent,
+                snapshot.primary_reset_at,
+                include_reset_datetime=include_reset_datetime,
+            )
         )
     if snapshot.secondary_used_percent is not None or snapshot.secondary_window_minutes is not None:
         parts.append(
-            f"{format_window_label(snapshot.secondary_window_minutes, 'weekly')} "
-            f"{format_remaining_quota(snapshot.secondary_used_percent)}"
+            summarize_quota_window(
+                format_window_label(snapshot.secondary_window_minutes, "weekly"),
+                snapshot.secondary_used_percent,
+                snapshot.secondary_reset_at,
+                include_reset_datetime=include_reset_datetime,
+            )
         )
 
     if snapshot.credits_unlimited:
@@ -1026,13 +1077,20 @@ def summarize_local_history_snapshot(snapshot: UsageSnapshot) -> str:
     return f"local history {token_text} ({share_text}, {thread_text})"
 
 
-def summarize_usage(usage: AccountUsage | None) -> str:
+def summarize_usage(usage: AccountUsage | None, *, include_live_reset_datetime: bool = False) -> str:
     if usage is None:
         return "unknown"
 
     parts: list[str] = []
     if usage.quota_snapshot is not None:
-        parts.append(summarize_quota_snapshot(usage.quota_snapshot))
+        parts.append(
+            summarize_quota_snapshot(
+                usage.quota_snapshot,
+                include_reset_datetime=(
+                    include_live_reset_datetime and usage.quota_snapshot.source == "live_rate_limits"
+                ),
+            )
+        )
     if usage.local_history_snapshot is not None:
         parts.append(summarize_local_history_snapshot(usage.local_history_snapshot))
     return "; ".join(parts) if parts else "unknown"
@@ -1171,6 +1229,40 @@ class SwitcherService:
             return AccountUsage(local_history_snapshot=fallback_snapshot)
         return replace(usage, local_history_snapshot=fallback_snapshot)
 
+    def get_active_status(self, *, refresh_quota: bool = True) -> ActiveStatus:
+        if not self.paths.auth_path.exists():
+            return ActiveStatus(metadata=None, saved_account=None, usage=None)
+
+        auth_payload, _ = read_json_file(self.paths.auth_path)
+        metadata = extract_auth_metadata(auth_payload)
+        saved_account = None
+        for account in self._load_registry().values():
+            if account.account_id == metadata.account_id:
+                saved_account = account
+                break
+
+        usage = load_usage_by_account(self.paths.logs_path, self.paths.state_path).get(metadata.account_id)
+        quota_refresh_error = None
+        if refresh_quota:
+            try:
+                live_snapshot, refreshed_payload = fetch_live_quota_snapshot(self.paths.codex_home, auth_payload)
+                saved_account = self._persist_active_auth_payload(refreshed_payload, saved_account)
+                metadata = extract_auth_metadata(refreshed_payload)
+                if usage is None:
+                    usage = AccountUsage(quota_snapshot=live_snapshot)
+                else:
+                    usage = replace(usage, quota_snapshot=live_snapshot)
+            except SwitcherError as exc:
+                quota_refresh_error = str(exc)
+
+        usage = self.augment_usage_with_active_history(metadata, usage)
+        return ActiveStatus(
+            metadata=metadata,
+            saved_account=saved_account,
+            usage=usage,
+            quota_refresh_error=quota_refresh_error,
+        )
+
     def load_usage(
         self,
         *,
@@ -1215,6 +1307,30 @@ class SwitcherService:
         write_json_atomic(snapshot_path, auth_payload)
         if active_account_id == saved_account.account_id:
             write_json_atomic(self.paths.auth_path, auth_payload)
+
+        updated_saved_account = replace(
+            saved_account,
+            email=metadata.email,
+            plan_type=metadata.plan_type,
+            token_expires_at=metadata.token_expires_at,
+        )
+        registry = self._load_registry()
+        registry[label_key(saved_account.label)] = updated_saved_account
+        self._save_registry(registry)
+        return updated_saved_account
+
+    def _persist_active_auth_payload(
+        self,
+        auth_payload: dict[str, Any],
+        saved_account: SavedAccount | None,
+    ) -> SavedAccount | None:
+        write_json_atomic(self.paths.auth_path, auth_payload)
+        if saved_account is None:
+            return None
+
+        metadata = extract_auth_metadata(auth_payload)
+        snapshot_path = self.paths.accounts_dir / saved_account.snapshot_name
+        write_json_atomic(snapshot_path, auth_payload)
 
         updated_saved_account = replace(
             saved_account,

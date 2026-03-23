@@ -7,6 +7,7 @@ from .core import (
     AppPaths,
     SwitcherError,
     SwitcherService,
+    format_timestamp,
     render_table,
     short_account_id,
     summarize_usage,
@@ -32,6 +33,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     switch_parser = subparsers.add_parser("switch", help="Make a saved account the active Codex login.")
     switch_parser.add_argument("label", help="Label of the saved account to activate.")
+
+    subparsers.add_parser("status", help="Show the active Codex account with a fresh ChatGPT quota fetch.")
 
     return parser
 
@@ -110,6 +113,46 @@ def command_switch(service: SwitcherService, label: str) -> int:
     return 0
 
 
+def command_status(service: SwitcherService) -> int:
+    status = service.get_active_status(refresh_quota=True)
+    if status.metadata is None:
+        print(f"No active Codex auth.json found at {service.paths.auth_path}.")
+        return 0
+
+    plan = status.metadata.plan_type
+    if (
+        status.usage is not None
+        and status.usage.quota_snapshot is not None
+        and status.usage.quota_snapshot.plan_type is not None
+    ):
+        plan = status.usage.quota_snapshot.plan_type
+
+    print("Active Codex account")
+    print(f"Label: {status.saved_account.label if status.saved_account is not None else 'unmanaged'}")
+    print(f"Email: {status.metadata.email}")
+    print(f"Plan: {plan}")
+    print(f"Account ID: {status.metadata.account_id}")
+    if status.metadata.token_expires_at is not None:
+        print(f"Access token expires: {format_timestamp(status.metadata.token_expires_at)}")
+    print(f"Usage: {summarize_usage(status.usage, include_live_reset_datetime=True)}")
+    if status.quota_refresh_error is not None:
+        print(f"Quota refresh: live fetch failed; {status.quota_refresh_error}")
+    if status.usage is not None:
+        if status.usage.quota_snapshot is not None:
+            if status.usage.quota_snapshot.source == "live_rate_limits":
+                print("Quota source: live ChatGPT rate limits fetch.")
+            else:
+                print("Quota source: last known Codex websocket snapshot, not a live ChatGPT quota fetch.")
+            print(f"Quota observed: {format_timestamp(status.usage.quota_snapshot.observed_at)}")
+        if status.usage.local_history_snapshot is not None:
+            if status.usage.local_history_snapshot.source == "active_auth_local_threads":
+                print("Local history source: threads updated since the current auth.json became active.")
+            else:
+                print("Local history source: local Codex thread history.")
+            print(f"Local history observed: {format_timestamp(status.usage.local_history_snapshot.observed_at)}")
+    return 0
+
+
 def render_usage_text(usage, *, fresh: bool = False) -> str:
     summary = summarize_usage(usage)
     if fresh and usage is not None and usage.quota_refresh_error is not None:
@@ -117,6 +160,7 @@ def render_usage_text(usage, *, fresh: bool = False) -> str:
             return "fresh fetch failed"
         return f"{summary}; fresh fetch failed"
     return summary
+
 
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
@@ -130,6 +174,8 @@ def main(argv: list[str] | None = None) -> int:
             return command_list(service, fresh=args.fresh)
         if args.command == "switch":
             return command_switch(service, args.label)
+        if args.command == "status":
+            return command_status(service)
     except SwitcherError as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return 1
