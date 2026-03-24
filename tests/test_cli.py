@@ -233,6 +233,10 @@ class SwitcherCliTests(unittest.TestCase):
                 exit_code = int(exc.code)
         return exit_code, stdout.getvalue(), stderr.getvalue()
 
+    def table_rows(self, stdout: str) -> list[str]:
+        lines = stdout.splitlines()
+        return lines[2:]
+
     def test_add_saves_current_account_snapshot(self) -> None:
         write_auth_file(self.paths.auth_path, "account-1", "one@example.com")
 
@@ -1215,10 +1219,196 @@ class SwitcherCliTests(unittest.TestCase):
         self.assertEqual(stderr, "")
         contact_line = next(line for line in stdout.splitlines() if "contact@img.pink" in line)
         other_line = next(line for line in stdout.splitlines() if "other@example.com" in line)
+        self.assertLess(self.table_rows(stdout).index(other_line), self.table_rows(stdout).index(contact_line))
         self.assertIn("5h 0% left", contact_line)
         self.assertIn("weekly 0% left", contact_line)
         self.assertIn("5h 80% left", other_line)
         self.assertIn("weekly 90% left", other_line)
+
+    def test_list_fresh_ranks_available_accounts_by_lowest_remaining_quota(self) -> None:
+        high_margin_token = build_access_token("account-1", "high@example.com")
+        low_margin_token = build_access_token("account-2", "low@example.com")
+
+        write_auth_file(self.paths.auth_path, "account-1", "high@example.com")
+        self.service.add_current_account("zeta")
+        write_auth_file(self.paths.auth_path, "account-2", "low@example.com")
+        self.service.add_current_account("alpha")
+
+        def fake_json_request(
+            url: str,
+            *,
+            headers: dict[str, str] | None = None,
+            payload: dict | None = None,
+            timeout_seconds: int = 15,
+        ) -> dict:
+            del payload, timeout_seconds
+            assert headers is not None
+            if url.endswith("/wham/usage") and headers["Authorization"] == f"Bearer {high_margin_token}":
+                return {
+                    "plan_type": "plus",
+                    "rate_limit": {
+                        "allowed": True,
+                        "limit_reached": False,
+                        "primary_window": {
+                            "used_percent": 10,
+                            "limit_window_seconds": 18_000,
+                            "reset_at": 1_773_969_965,
+                        },
+                        "secondary_window": {
+                            "used_percent": 20,
+                            "limit_window_seconds": 604_800,
+                            "reset_at": 1_774_569_999,
+                        },
+                    },
+                }
+            if url.endswith("/wham/usage") and headers["Authorization"] == f"Bearer {low_margin_token}":
+                return {
+                    "plan_type": "plus",
+                    "rate_limit": {
+                        "allowed": True,
+                        "limit_reached": False,
+                        "primary_window": {
+                            "used_percent": 5,
+                            "limit_window_seconds": 18_000,
+                            "reset_at": 1_773_969_965,
+                        },
+                        "secondary_window": {
+                            "used_percent": 70,
+                            "limit_window_seconds": 604_800,
+                            "reset_at": 1_774_569_999,
+                        },
+                    },
+                }
+            raise AssertionError(f"unexpected request {url} {headers}")
+
+        with patch("gpt_switcher.core.json_request", side_effect=fake_json_request):
+            exit_code, stdout, stderr = self.run_cli("list", "--fresh")
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(stderr, "")
+        rows = self.table_rows(stdout)
+        self.assertIn("zeta", rows[0])
+        self.assertIn("alpha", rows[1])
+
+    def test_list_fresh_treats_exhausted_weekly_quota_as_unavailable(self) -> None:
+        blocked_token = build_access_token("account-1", "blocked@example.com")
+        available_token = build_access_token("account-2", "available@example.com")
+
+        write_auth_file(self.paths.auth_path, "account-1", "blocked@example.com")
+        self.service.add_current_account("alpha")
+        write_auth_file(self.paths.auth_path, "account-2", "available@example.com")
+        self.service.add_current_account("zeta")
+
+        def fake_json_request(
+            url: str,
+            *,
+            headers: dict[str, str] | None = None,
+            payload: dict | None = None,
+            timeout_seconds: int = 15,
+        ) -> dict:
+            del payload, timeout_seconds
+            assert headers is not None
+            if url.endswith("/wham/usage") and headers["Authorization"] == f"Bearer {blocked_token}":
+                return {
+                    "plan_type": "plus",
+                    "rate_limit": {
+                        "allowed": False,
+                        "limit_reached": True,
+                        "primary_window": {
+                            "used_percent": 0,
+                            "limit_window_seconds": 18_000,
+                            "reset_at": 1_773_969_965,
+                        },
+                        "secondary_window": {
+                            "used_percent": 100,
+                            "limit_window_seconds": 604_800,
+                            "reset_at": 1_774_000_000,
+                        },
+                    },
+                }
+            if url.endswith("/wham/usage") and headers["Authorization"] == f"Bearer {available_token}":
+                return {
+                    "plan_type": "plus",
+                    "rate_limit": {
+                        "allowed": True,
+                        "limit_reached": False,
+                        "primary_window": {
+                            "used_percent": 15,
+                            "limit_window_seconds": 18_000,
+                            "reset_at": 1_773_969_965,
+                        },
+                        "secondary_window": {
+                            "used_percent": 25,
+                            "limit_window_seconds": 604_800,
+                            "reset_at": 1_774_569_999,
+                        },
+                    },
+                }
+            raise AssertionError(f"unexpected request {url} {headers}")
+
+        with patch("gpt_switcher.core.json_request", side_effect=fake_json_request):
+            exit_code, stdout, stderr = self.run_cli("list", "--fresh")
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(stderr, "")
+        rows = self.table_rows(stdout)
+        self.assertIn("zeta", rows[0])
+        self.assertIn("alpha", rows[1])
+
+    def test_list_fresh_ranks_unavailable_accounts_by_earliest_reset(self) -> None:
+        early_reset_token = build_access_token("account-1", "early@example.com")
+        late_reset_token = build_access_token("account-2", "late@example.com")
+
+        write_auth_file(self.paths.auth_path, "account-1", "early@example.com")
+        self.service.add_current_account("zeta")
+        write_auth_file(self.paths.auth_path, "account-2", "late@example.com")
+        self.service.add_current_account("alpha")
+
+        def fake_json_request(
+            url: str,
+            *,
+            headers: dict[str, str] | None = None,
+            payload: dict | None = None,
+            timeout_seconds: int = 15,
+        ) -> dict:
+            del payload, timeout_seconds
+            assert headers is not None
+            if url.endswith("/wham/usage") and headers["Authorization"] == f"Bearer {early_reset_token}":
+                return {
+                    "plan_type": "plus",
+                    "rate_limit": {
+                        "allowed": False,
+                        "limit_reached": True,
+                        "primary_window": {
+                            "used_percent": 100,
+                            "limit_window_seconds": 18_000,
+                            "reset_at": 1_773_969_965,
+                        },
+                    },
+                }
+            if url.endswith("/wham/usage") and headers["Authorization"] == f"Bearer {late_reset_token}":
+                return {
+                    "plan_type": "plus",
+                    "rate_limit": {
+                        "allowed": False,
+                        "limit_reached": True,
+                        "primary_window": {
+                            "used_percent": 100,
+                            "limit_window_seconds": 18_000,
+                            "reset_at": 1_774_969_965,
+                        },
+                    },
+                }
+            raise AssertionError(f"unexpected request {url} {headers}")
+
+        with patch("gpt_switcher.core.json_request", side_effect=fake_json_request):
+            exit_code, stdout, stderr = self.run_cli("list", "--fresh")
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(stderr, "")
+        rows = self.table_rows(stdout)
+        self.assertIn("zeta", rows[0])
+        self.assertIn("alpha", rows[1])
 
     def test_list_fresh_retries_after_unauthorized_for_inactive_account_and_updates_snapshot(self) -> None:
         write_auth_file(self.paths.auth_path, "account-1", "one@example.com")
@@ -1294,7 +1484,9 @@ class SwitcherCliTests(unittest.TestCase):
 
     def test_list_fresh_marks_fallback_when_live_fetch_fails(self) -> None:
         write_auth_file(self.paths.auth_path, "account-1", "one@example.com")
-        self.service.add_current_account("personal")
+        self.service.add_current_account("zeta")
+        write_auth_file(self.paths.auth_path, "account-2", "two@example.com")
+        self.service.add_current_account("alpha")
         create_logs_db(self.paths.logs_path)
         insert_log(
             self.paths.logs_path,
@@ -1333,7 +1525,25 @@ class SwitcherCliTests(unittest.TestCase):
 
         self.assertEqual(exit_code, 0)
         self.assertEqual(stderr, "")
+        rows = self.table_rows(stdout)
+        self.assertIn("zeta", rows[0])
+        self.assertIn("alpha", rows[1])
         self.assertIn("5h 95% left; weekly 70% left; fresh fetch failed", stdout)
+        self.assertIn("fresh fetch failed", rows[1])
+
+    def test_list_without_fresh_keeps_label_sort_order(self) -> None:
+        write_auth_file(self.paths.auth_path, "account-1", "one@example.com")
+        self.service.add_current_account("zeta")
+        write_auth_file(self.paths.auth_path, "account-2", "two@example.com")
+        self.service.add_current_account("alpha")
+
+        exit_code, stdout, stderr = self.run_cli("list")
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(stderr, "")
+        rows = self.table_rows(stdout)
+        self.assertIn("alpha", rows[0])
+        self.assertIn("zeta", rows[1])
 
     def test_local_usage_summary_shows_percentage_share(self) -> None:
         create_logs_db(self.paths.logs_path)

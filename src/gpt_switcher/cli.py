@@ -4,7 +4,9 @@ import argparse
 import sys
 
 from .core import (
+    AccountUsage,
     AppPaths,
+    SavedAccount,
     SwitcherError,
     SwitcherService,
     format_timestamp,
@@ -66,6 +68,11 @@ def command_list(service: SwitcherService, fresh: bool = False) -> int:
         if active_usage is not None:
             usage_by_account = dict(usage_by_account)
             usage_by_account[saved_account_key(active_saved_account)] = active_usage
+    if fresh:
+        accounts = sorted(
+            accounts,
+            key=lambda account: fresh_account_sort_key(account, usage_by_account.get(saved_account_key(account))),
+        )
 
     rows: list[list[str]] = []
     for account in accounts:
@@ -166,6 +173,43 @@ def render_usage_text(usage, *, fresh: bool = False) -> str:
             return "fresh fetch failed"
         return f"{summary}; fresh fetch failed"
     return summary
+
+
+def fresh_account_sort_key(account: SavedAccount, usage: AccountUsage | None) -> tuple[int, int, int, str]:
+    label_key = account.label.casefold()
+    snapshot = usage.quota_snapshot if usage is not None else None
+    if snapshot is None:
+        return (2, sys.maxsize, sys.maxsize, label_key)
+
+    windows: list[tuple[int | None, int | None]] = []
+    for used_percent, reset_at in (
+        (snapshot.primary_used_percent, snapshot.primary_reset_at),
+        (snapshot.secondary_used_percent, snapshot.secondary_reset_at),
+    ):
+        if used_percent is None and reset_at is None:
+            continue
+        remaining_percent = None if used_percent is None else max(0, 100 - used_percent)
+        windows.append((remaining_percent, reset_at))
+
+    if not windows or any(remaining_percent is None for remaining_percent, _ in windows):
+        return (2, sys.maxsize, sys.maxsize, label_key)
+
+    remaining_values = [remaining_percent for remaining_percent, _ in windows if remaining_percent is not None]
+    if all(remaining_percent > 0 for remaining_percent in remaining_values):
+        earliest_reset = min(
+            (reset_at for _, reset_at in windows if reset_at is not None),
+            default=sys.maxsize,
+        )
+        return (0, -min(remaining_values), earliest_reset, label_key)
+
+    exhausted_resets = [
+        reset_at
+        for remaining_percent, reset_at in windows
+        if remaining_percent is not None and remaining_percent <= 0 and reset_at is not None
+    ]
+    if exhausted_resets:
+        return (1, min(exhausted_resets), sys.maxsize, label_key)
+    return (2, sys.maxsize, sys.maxsize, label_key)
 
 
 def main(argv: list[str] | None = None) -> int:
